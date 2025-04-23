@@ -1,0 +1,10 @@
+{
+    "name": "n1-dev",
+    "image": "mcr.microsoft.com/devcontainers/go:1.22",
+    "postCreateCommand": "go env -w GOPRIVATE=github.com/n1/*",
+    "features": {
+      "ghcr.io/devcontainers/features/sqlite-cli:1": {},
+      "ghcr.io/devcontainers/features/sqlcipher:1": {}
+    }
+  }
+  

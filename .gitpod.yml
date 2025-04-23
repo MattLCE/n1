@@ -1,0 +1,4 @@
+image: mcr.microsoft.com/devcontainers/go:1.22
+ports:
+  - port: 8080
+    onOpen: open-preview
