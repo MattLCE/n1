@@ -1,0 +1,124 @@
+--- File: cmd/bosr/main.go ---
+package main
+
+import (
+	"fmt"
+)
+
+const version = "0.0.1-dev"
+
+func main() {
+	fmt.Println("bosr version", version)
+}
+
+--- End: cmd/bosr/main.go ---
+
+--- File: dump_workspace.sh ---
+#!/bin/bash
+
+# This script dumps the content of all files tracked by Git AND untracked files
+# (respecting .gitignore) into workspace_dump.txt in the current directory.
+
+echo "Dumping tracked and untracked files to workspace_dump.txt..."
+
+git ls-files --exclude-standard --others | while IFS= read -r filename; do
+  echo "--- File: $filename ---"
+  # Handle potential errors reading a file
+  if cat "$filename"; then
+    echo # Add newline after content only if cat succeeded
+  else
+    echo ">>> Error reading file: $filename <<<"
+  fi
+  echo "--- End: $filename ---"
+  echo # Add blank line for separation
+done > workspace_dump.txt
+
+echo "Dump complete: workspace_dump.txt"
+--- End: dump_workspace.sh ---
+
+--- File: go.mod ---
+module github.com/n1/n1
+
+go 1.23.8
+
+require (
+	github.com/mattn/go-colorable v0.1.13 // indirect
+	github.com/mattn/go-isatty v0.0.19 // indirect
+	github.com/rs/zerolog v1.34.0 // indirect
+	github.com/stretchr/testify v1.10.0 // indirect
+	golang.org/x/sys v0.12.0 // indirect
+)
+
+--- End: go.mod ---
+
+--- File: go.sum ---
+github.com/coreos/go-systemd/v22 v22.5.0/go.mod h1:Y58oyj3AT4RCenI/lSvhwexgC+NSVTIJ3seZv2GcEnc=
+github.com/godbus/dbus/v5 v5.0.4/go.mod h1:xhWf0FNVPg57R7Z0UbKHbJfkEywrmjJnf7w5xrFpKfA=
+github.com/mattn/go-colorable v0.1.13 h1:fFA4WZxdEF4tXPZVKMLwD8oUnCTTo08duU7wxecdEvA=
+github.com/mattn/go-colorable v0.1.13/go.mod h1:7S9/ev0klgBDR4GtXTXX8a3vIGJpMovkB8vQcUbaXHg=
+github.com/mattn/go-isatty v0.0.16/go.mod h1:kYGgaQfpe5nmfYZH+SKPsOc2e4SrIfOl2e/yFXSvRLM=
+github.com/mattn/go-isatty v0.0.19 h1:JITubQf0MOLdlGRuRq+jtsDlekdYPia9ZFsB8h/APPA=
+github.com/mattn/go-isatty v0.0.19/go.mod h1:W+V8PltTTMOvKvAeJH7IuucS94S2C6jfK/D7dTCTo3Y=
+github.com/pkg/errors v0.9.1/go.mod h1:bwawxfHBFNV+L2hUp1rHADufV3IMtnDRdf1r5NINEl0=
+github.com/rs/xid v1.6.0/go.mod h1:7XoLgs4eV+QndskICGsho+ADou8ySMSjJKDIan90Nz0=
+github.com/rs/zerolog v1.34.0 h1:k43nTLIwcTVQAncfCw4KZ2VY6ukYoZaBPNOE8txlOeY=
+github.com/rs/zerolog v1.34.0/go.mod h1:bJsvje4Z08ROH4Nhs5iH600c3IkWhwp44iRc54W6wYQ=
+github.com/stretchr/testify v1.10.0 h1:Xv5erBjTwe/5IxqUQTdXv5kgmIvbHo3QQyRwhJsOfJA=
+github.com/stretchr/testify v1.10.0/go.mod h1:r2ic/lqez/lEtzL7wO/rwa5dbSLXVDPFyf8C91i36aY=
+golang.org/x/sys v0.0.0-20220811171246-fbc7d0a398ab/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+golang.org/x/sys v0.6.0/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+golang.org/x/sys v0.12.0 h1:CM0HF96J0hcLAwsHPJZjfdNzs0gftsLfgKt57wWHJ0o=
+golang.org/x/sys v0.12.0/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+
+--- End: go.sum ---
+
+--- File: internal/crypto/masterkey.go ---
+package crypto
+
+import "crypto/rand"
+
+// Generate returns n random bytes.
+func Generate(n int) ([]byte, error) {
+	buf := make([]byte, n)
+	_, err := rand.Read(buf)
+	return buf, err
+}
+
+--- End: internal/crypto/masterkey.go ---
+
+--- File: internal/crypto/masterkey_test.go ---
+package crypto
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
+
+func TestGenerate(t *testing.T) {
+	key, err := Generate(32)
+	require.NoError(t, err)
+	require.Len(t, key, 32)
+}
+
+--- End: internal/crypto/masterkey_test.go ---
+
+--- File: internal/holdr/hold.go ---
+package holdr
+
+--- End: internal/holdr/hold.go ---
+
+--- File: internal/sqlite/securedb.go ---
+package sqlite
+
+--- End: internal/sqlite/securedb.go ---
+
+--- File: internal/sqlite/securedb_test.go ---
+package sqlite_test // or package sqlite, depending on convention used
+
+--- End: internal/sqlite/securedb_test.go ---
+
+--- File: workspace_dump.txt ---
+>>> Error reading file: workspace_dump.txt <<<
+--- End: workspace_dump.txt ---
+
