@@ -1,10 +1,12 @@
+// .devcontainer/devcontainer.json
 {
-    "name": "n1-dev",
-    "image": "mcr.microsoft.com/devcontainers/go:1.22",
-    "postCreateCommand": "go env -w GOPRIVATE=github.com/n1/*",
-    "features": {
-      "ghcr.io/devcontainers/features/sqlite-cli:1": {},
-      "ghcr.io/devcontainers/features/sqlcipher:1": {}
-    }
-  }
-  
+  "name": "n1-dev",
+  "image": "mcr.microsoft.com/devcontainers/go:1.23",
+
+  // Runs once, right after the container is created
+  "postCreateCommand": "bash -c 'sudo apt-get update && sudo apt-get install -y sqlite3 sqlcipher && go env -w GOPRIVATE=github.com/n1/* && go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest'",
+
+
+  // Runs every time VS Code attaches
+  "postAttachCommand": "echo \"🎉  dev-container ready\""
+}
