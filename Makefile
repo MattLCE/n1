@@ -1,10 +1,12 @@
-.PHONY: test lint vet
+.DEFAULT_GOAL := vet
+
+.PHONY: test vet lint
 
 test:
 	go test ./...
 
-lint:
-	golangci-lint run ./...
-
 vet:
 	go vet ./...
+
+lint:
+	golangci-lint run ./...
