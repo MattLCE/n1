@@ -1,4 +1,4 @@
-Dump generated on: Sat Apr 26 06:26:17 PM UTC 2025
+Dump generated on: Sat Apr 26 09:08:04 PM UTC 2025
 --- Start of dump ---
 
 --- File: .devcontainer/devcontainer.json ---
@@ -22,6 +22,30 @@ Dump generated on: Sat Apr 26 06:26:17 PM UTC 2025
 * text=auto
 
 --- End: .gitattributes ---
+
+--- File: .github/workflows/ci.yml ---
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - run: go test ./...
+      - run: go vet ./...
+      - uses: golangci/golangci-lint-action@v3
+        with:
+          version: v1.64.8
+
+--- End: .github/workflows/ci.yml ---
 
 --- File: .gitignore ---
 # If you prefer the allow list template instead of the deny list, see community template:
@@ -56,6 +80,28 @@ ports:
 
 --- End: .gitpod.yml ---
 
+--- File: .golangci.yml ---
+run:
+  timeout: 3m
+  skip-dirs:
+    - .devcontainer
+
+linters:
+  enable:
+    - govet
+    - staticcheck
+    - revive          # reasonable style checker
+    - errcheck
+    - gosec           # light security scan
+
+linters-settings:
+  revive:
+    ignore-generated-header: true
+  govet:
+    check-shadowing: true
+
+--- End: .golangci.yml ---
+
 --- File: LICENSE ---
 MIT License
 
@@ -82,16 +128,18 @@ SOFTWARE.
 --- End: LICENSE ---
 
 --- File: Makefile ---
-.PHONY: test lint vet
+.DEFAULT_GOAL := vet
+
+.PHONY: test vet lint
 
 test:
 	go test ./...
 
-lint:
-	golangci-lint run ./...
-
 vet:
 	go vet ./...
+
+lint:
+	golangci-lint run ./...
 
 --- End: Makefile ---
 
@@ -106,12 +154,127 @@ package main
 
 import (
 	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+
+	"github.com/n1/n1/internal/crypto"
+	"github.com/n1/n1/internal/secretstore"
+	"github.com/n1/n1/internal/sqlite"
+	"github.com/urfave/cli/v2"
 )
 
 const version = "0.0.1-dev"
 
 func main() {
-	fmt.Println("bosr version", version)
+	app := &cli.App{
+		Name:    "bosr",
+		Version: version,
+		Usage:   "bosr – the n1 lock-box CLI",
+		Commands: []*cli.Command{
+			initCmd,
+			openCmd,
+			keyRotateCmd,
+		},
+	}
+
+	if err := app.Run(os.Args); err != nil {
+		log.Fatal(err)
+	}
+}
+
+/* ----------------- commands ----------------- */
+
+var initCmd = &cli.Command{
+	Name:      "init",
+	Usage:     "init <vault.db>   – create encrypted vault",
+	ArgsUsage: "<path>",
+	Action: func(c *cli.Context) error {
+		if c.NArg() != 1 {
+			return cli.Exit("need target path", 1)
+		}
+		path, _ := filepath.Abs(c.Args().First())
+
+		// 1· generate master-key
+		mk, err := crypto.Generate(32)
+		if err != nil {
+			return err
+		}
+
+		// 2· persist in secret store
+		if err := secretstore.Default.Put(path, mk); err != nil {
+			return err
+		}
+
+		// 3· create encrypted DB
+		db, err := sqlite.Open(path, mk)
+		if err != nil {
+			return err
+		}
+		defer db.Close()
+
+		// baseline schema
+		_, err = db.Exec(`CREATE TABLE IF NOT EXISTS schema_migrations (id INTEGER PRIMARY KEY)`)
+		return err
+	},
+}
+
+var openCmd = &cli.Command{
+	Name:  "open",
+	Usage: "open <vault.db>     – test decryption",
+	Action: func(c *cli.Context) error {
+		if c.NArg() != 1 {
+			return cli.Exit("need vault path", 1)
+		}
+		path, _ := filepath.Abs(c.Args().First())
+		mk, err := secretstore.Default.Get(path)
+		if err != nil {
+			return err
+		}
+		db, err := sqlite.Open(path, mk)
+		if err != nil {
+			return err
+		}
+		defer db.Close()
+		fmt.Println("✓ vault opened")
+		return nil
+	},
+}
+
+var keyRotateCmd = &cli.Command{
+	Name:  "key",
+	Usage: "key rotate <vault.db>  – create new master-key & re-encrypt",
+	Subcommands: []*cli.Command{
+		{
+			Name:  "rotate",
+			Usage: "rotate encryption key in-place",
+			Action: func(c *cli.Context) error {
+				if c.NArg() != 1 {
+					return cli.Exit("need vault path", 1)
+				}
+				path, _ := filepath.Abs(c.Args().First())
+				oldMK, err := secretstore.Default.Get(path)
+				if err != nil {
+					return err
+				}
+				db, err := sqlite.Open(path, oldMK)
+				if err != nil {
+					return err
+				}
+				defer db.Close()
+
+				newMK, _ := crypto.Generate(32)
+				if _, err := db.Exec(fmt.Sprintf("PRAGMA rekey = \"x'%x'\";", newMK)); err != nil {
+					return err
+				}
+				if err := secretstore.Default.Put(path, newMK); err != nil {
+					return err
+				}
+				fmt.Println("✓ key rotated")
+				return nil
+			},
+		},
+	},
 }
 
 --- End: cmd/bosr/main.go ---
@@ -157,23 +320,80 @@ module github.com/n1/n1
 
 go 1.23.8
 
-require github.com/stretchr/testify v1.10.0
+require (
+	github.com/mattn/go-sqlite3 v1.14.28
+	github.com/rs/zerolog v1.34.0
+	github.com/stretchr/testify v1.10.0
+	github.com/urfave/cli/v2 v2.27.6
+	github.com/zalando/go-keyring v0.2.6
+	golang.org/x/crypto v0.37.0
+)
 
 require (
+	al.essio.dev/pkg/shellescape v1.5.1 // indirect
+	github.com/cpuguy83/go-md2man/v2 v2.0.5 // indirect
+	github.com/danieljoos/wincred v1.2.2 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
+	github.com/godbus/dbus/v5 v5.1.0 // indirect
+	github.com/mattn/go-colorable v0.1.13 // indirect
+	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
+	github.com/russross/blackfriday/v2 v2.1.0 // indirect
+	github.com/xrash/smetrics v0.0.0-20240521201337-686a1a2994c1 // indirect
+	golang.org/x/sys v0.32.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
 --- End: go.mod ---
 
 --- File: go.sum ---
+al.essio.dev/pkg/shellescape v1.5.1 h1:86HrALUujYS/h+GtqoB26SBEdkWfmMI6FubjXlsXyho=
+al.essio.dev/pkg/shellescape v1.5.1/go.mod h1:6sIqp7X2P6mThCQ7twERpZTuigpr6KbZWtls1U8I890=
+github.com/coreos/go-systemd/v22 v22.5.0/go.mod h1:Y58oyj3AT4RCenI/lSvhwexgC+NSVTIJ3seZv2GcEnc=
+github.com/cpuguy83/go-md2man/v2 v2.0.5 h1:ZtcqGrnekaHpVLArFSe4HK5DoKx1T0rq2DwVB0alcyc=
+github.com/cpuguy83/go-md2man/v2 v2.0.5/go.mod h1:tgQtvFlXSQOSOSIRvRPT7W67SCa46tRHOmNcaadrF8o=
+github.com/danieljoos/wincred v1.2.2 h1:774zMFJrqaeYCK2W57BgAem/MLi6mtSE47MB6BOJ0i0=
+github.com/danieljoos/wincred v1.2.2/go.mod h1:w7w4Utbrz8lqeMbDAK0lkNJUv5sAOkFi7nd/ogr0Uh8=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
+github.com/godbus/dbus/v5 v5.0.4/go.mod h1:xhWf0FNVPg57R7Z0UbKHbJfkEywrmjJnf7w5xrFpKfA=
+github.com/godbus/dbus/v5 v5.1.0 h1:4KLkAxT3aOY8Li4FRJe/KvhoNFFxo0m6fNuFUO8QJUk=
+github.com/godbus/dbus/v5 v5.1.0/go.mod h1:xhWf0FNVPg57R7Z0UbKHbJfkEywrmjJnf7w5xrFpKfA=
+github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510 h1:El6M4kTTCOh6aBiKaUGG7oYTSPP8MxqL4YI3kZKwcP4=
+github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510/go.mod h1:pupxD2MaaD3pAXIBCelhxNneeOaAeabZDe5s4K6zSpQ=
+github.com/mattn/go-colorable v0.1.13 h1:fFA4WZxdEF4tXPZVKMLwD8oUnCTTo08duU7wxecdEvA=
+github.com/mattn/go-colorable v0.1.13/go.mod h1:7S9/ev0klgBDR4GtXTXX8a3vIGJpMovkB8vQcUbaXHg=
+github.com/mattn/go-isatty v0.0.16/go.mod h1:kYGgaQfpe5nmfYZH+SKPsOc2e4SrIfOl2e/yFXSvRLM=
+github.com/mattn/go-isatty v0.0.19/go.mod h1:W+V8PltTTMOvKvAeJH7IuucS94S2C6jfK/D7dTCTo3Y=
+github.com/mattn/go-isatty v0.0.20 h1:xfD0iDuEKnDkl03q4limB+vH+GxLEtL/jb4xVJSWWEY=
+github.com/mattn/go-isatty v0.0.20/go.mod h1:W+V8PltTTMOvKvAeJH7IuucS94S2C6jfK/D7dTCTo3Y=
+github.com/mattn/go-sqlite3 v1.14.28 h1:ThEiQrnbtumT+QMknw63Befp/ce/nUPgBPMlRFEum7A=
+github.com/mattn/go-sqlite3 v1.14.28/go.mod h1:Uh1q+B4BYcTPb+yiD3kU8Ct7aC0hY9fxUwlHK0RXw+Y=
+github.com/pkg/errors v0.9.1/go.mod h1:bwawxfHBFNV+L2hUp1rHADufV3IMtnDRdf1r5NINEl0=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
+github.com/rs/xid v1.6.0/go.mod h1:7XoLgs4eV+QndskICGsho+ADou8ySMSjJKDIan90Nz0=
+github.com/rs/zerolog v1.34.0 h1:k43nTLIwcTVQAncfCw4KZ2VY6ukYoZaBPNOE8txlOeY=
+github.com/rs/zerolog v1.34.0/go.mod h1:bJsvje4Z08ROH4Nhs5iH600c3IkWhwp44iRc54W6wYQ=
+github.com/russross/blackfriday/v2 v2.1.0 h1:JIOH55/0cWyOuilr9/qlrm0BSXldqnqwMsf35Ld67mk=
+github.com/russross/blackfriday/v2 v2.1.0/go.mod h1:+Rmxgy9KzJVeS9/2gXHxylqXiyQDYRxCVz55jmeOWTM=
+github.com/stretchr/objx v0.5.2 h1:xuMeJ0Sdp5ZMRXx/aWO6RZxdr3beISkG5/G/aIRr3pY=
+github.com/stretchr/objx v0.5.2/go.mod h1:FRsXN1f5AsAjCGJKqEizvkpNtU+EGNCLh3NxZ/8L+MA=
 github.com/stretchr/testify v1.10.0 h1:Xv5erBjTwe/5IxqUQTdXv5kgmIvbHo3QQyRwhJsOfJA=
 github.com/stretchr/testify v1.10.0/go.mod h1:r2ic/lqez/lEtzL7wO/rwa5dbSLXVDPFyf8C91i36aY=
+github.com/urfave/cli/v2 v2.27.6 h1:VdRdS98FNhKZ8/Az8B7MTyGQmpIr36O1EHybx/LaZ4g=
+github.com/urfave/cli/v2 v2.27.6/go.mod h1:3Sevf16NykTbInEnD0yKkjDAeZDS0A6bzhBH5hrMvTQ=
+github.com/xrash/smetrics v0.0.0-20240521201337-686a1a2994c1 h1:gEOO8jv9F4OT7lGCjxCBTO/36wtF6j2nSip77qHd4x4=
+github.com/xrash/smetrics v0.0.0-20240521201337-686a1a2994c1/go.mod h1:Ohn+xnUBiLI6FVj/9LpzZWtj1/D6lUovWYBkxHVV3aM=
+github.com/zalando/go-keyring v0.2.6 h1:r7Yc3+H+Ux0+M72zacZoItR3UDxeWfKTcabvkI8ua9s=
+github.com/zalando/go-keyring v0.2.6/go.mod h1:2TCrxYrbUNYfNS/Kgy/LSrkSQzZ5UPVH85RwfczwvcI=
+golang.org/x/crypto v0.37.0 h1:kJNSjF/Xp7kU0iB2Z+9viTPMW4EqqsrywMXLJOOsXSE=
+golang.org/x/crypto v0.37.0/go.mod h1:vg+k43peMZ0pUMhYmVAWysMK35e6ioLh3wB8ZCAfbVc=
+golang.org/x/sys v0.0.0-20220811171246-fbc7d0a398ab/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+golang.org/x/sys v0.6.0/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+golang.org/x/sys v0.12.0/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+golang.org/x/sys v0.32.0 h1:s77OFDvIQeibCmezSnk/q6iAfkdiQaJi4VzroCFrN20=
+golang.org/x/sys v0.32.0/go.mod h1:BJP2sWEmIv4KK5OTEluFJCKSidICx8ciO85XgH3Ak8k=
 gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405 h1:yhCVgyC4o1eVCa2tZl7eS0r+SDo693bJlVdllGtEeKM=
 gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405/go.mod h1:Co6ibVJAznAaIkqp8huTwlJQCZ016jof/cbN4VW5Yz0=
 gopkg.in/yaml.v3 v3.0.1 h1:fxVm/GzAzEWqLHuvctI91KS9hhNmmWOoWu0XTYJS7CA=
@@ -215,15 +435,118 @@ func TestGenerate(t *testing.T) {
 --- File: internal/holdr/hold.go ---
 package holdr
 
+// TODO(M1): domain model for note/hold records.
+type Keep struct{}
+
 --- End: internal/holdr/hold.go ---
 
+--- File: internal/log/log.go ---
+package log
+
+import (
+	"os"
+
+	"github.com/rs/zerolog"
+)
+
+var (
+	// L is the shared logger (use log.L.Info().Msg("hi"))
+	L zerolog.Logger
+)
+
+func init() {
+	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
+	L = zerolog.New(os.Stdout).With().Timestamp().Logger()
+}
+
+--- End: internal/log/log.go ---
+
 --- File: internal/sqlite/securedb.go ---
+//go:build cgo && !js && !wasm
+
 package sqlite
+
+/*
+#cgo CFLAGS: -DSQLITE_HAS_CODEC
+#cgo LDFLAGS: -lsqlcipher
+*/
+import (
+	"database/sql"
+	"errors"
+	"fmt"
+
+	_ "github.com/mattn/go-sqlite3" // cgo / sqlcipher build
+)
+
+// Open returns an *encrypted* sqlite handle (creates file if needed).
+func Open(path string, key []byte) (*sql.DB, error) {
+	dsn := fmt.Sprintf(
+		"file:%s?_pragma_key=x'%x'&_pragma_cipher_page_size=4096&_busy_timeout=10000",
+		path, key,
+	)
+
+	db, err := sql.Open("sqlite3", dsn)
+	if err != nil {
+		return nil, err
+	}
+
+	// ── verify that the key really decrypts the database ────────────────
+	var res string
+	if err := db.QueryRow(`PRAGMA cipher_integrity_check;`).Scan(&res); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if res != "ok" {
+		db.Close()
+		return nil, errors.New("invalid encryption key")
+	}
+	// ────────────────────────────────────────────────────────────────────
+	return db, nil
+}
 
 --- End: internal/sqlite/securedb.go ---
 
 --- File: internal/sqlite/securedb_test.go ---
-package sqlite_test // or package sqlite, depending on convention used
+package sqlite
+
+import (
+	"path/filepath"
+	"testing"
+
+	"github.com/n1/n1/internal/crypto"
+)
+
+func TestOpenEncrypted(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "vault.db")
+	mk, _ := crypto.Generate(32)
+
+	db, err := Open(dbPath, mk)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec(`CREATE TABLE foo (id INTEGER)`); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// reopen with same key
+	db, err = Open(dbPath, mk)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	db.Close()
+
+	// negative test: wrong key
+	wrongKey, _ := crypto.Generate(32)
+	if _, err := Open(dbPath, wrongKey); err == nil {
+		t.Fatalf("expected error with wrong key")
+	}
+}
 
 --- End: internal/sqlite/securedb_test.go ---
 

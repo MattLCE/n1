@@ -1,12 +1,15 @@
 // .devcontainer/devcontainer.json
 {
   "name": "n1-dev",
-  "image": "mcr.microsoft.com/devcontainers/go:1.23",
+  "image": "mcr.microsoft.com/devcontainers/go:1.23", // Sticking with Bookworm base for now
 
-  // Runs once, right after the container is created
-  "postCreateCommand": "bash -c 'sudo apt-get update && sudo apt-get install -y sqlite3 sqlcipher && go env -w GOPRIVATE=github.com/n1/* && go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest'",
+  // Define environment variables for the container - REMOVED LD_LIBRARY_PATH
+  // "containerEnv": {}, // Can remove if empty
 
+  // Simplified postCreateCommand - removed SQLCipher build
+  "postCreateCommand": "bash -xc 'export DEBIAN_FRONTEND=noninteractive && sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential libssl-dev git sqlite3 && sudo apt-get clean && sudo rm -rf /var/lib/apt/lists/* && go env -w GOPRIVATE=github.com/n1/* && go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest'",
+// ^^ Kept build-essential, libssl-dev (for keyring/crypto), git, sqlite3 (CLI tool)
+// ^^ Removed tcl, clone, configure, make, make install, ldconfig, rm -rf /tmp/sqlcipher
 
-  // Runs every time VS Code attaches
-  "postAttachCommand": "echo \"🎉  dev-container ready\""
+  "postAttachCommand": "echo \"🎉  dev-container ready (standard SQLite)\"" // Updated message
 }
