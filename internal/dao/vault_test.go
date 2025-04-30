@@ -157,48 +157,5 @@ func TestSecureVaultDAO(t *testing.T) {
 	assert.ErrorIs(t, err, ErrNotFound, "Expected ErrNotFound after delete")
 }
 
-func TestSecureVaultDAORotateKey(t *testing.T) {
-	db := setupTestDB(t)
-	defer db.Close()
-
-	// Generate original key
-	originalKey, err := crypto.Generate(32)
-	require.NoError(t, err, "Failed to generate original key")
-
-	dao := NewSecureVaultDAO(db, originalKey)
-
-	// Add some test data
-	testData := map[string][]byte{
-		"key1": []byte("value1"),
-		"key2": []byte("value2"),
-		"key3": []byte("value3"),
-	}
-
-	for k, v := range testData {
-		err = dao.Put(k, v)
-		require.NoError(t, err, "Failed to put test data")
-	}
-
-	// Generate new key
-	newKey, err := crypto.Generate(32)
-	require.NoError(t, err, "Failed to generate new key")
-
-	// Rotate the key
-	err = dao.RotateKey(newKey)
-	require.NoError(t, err, "Key rotation failed")
-
-	// Verify data can be accessed with new key
-	newDAO := NewSecureVaultDAO(db, newKey)
-	for k, expectedValue := range testData {
-		value, err := newDAO.Get(k)
-		require.NoError(t, err, "Failed to get value with new key")
-		assert.Equal(t, expectedValue, value, "Value mismatch after key rotation")
-	}
-
-	// Verify data cannot be accessed with old key
-	oldDAO := NewSecureVaultDAO(db, originalKey)
-	for k := range testData {
-		_, err := oldDAO.Get(k)
-		assert.Error(t, err, "Should not be able to decrypt with old key")
-	}
-}
+// Note: TestSecureVaultDAORotateKey has been removed as the RotateKey method
+// has been moved to the CLI implementation for more robust handling

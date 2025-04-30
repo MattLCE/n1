@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -35,7 +36,9 @@ func TestBosrCLI(t *testing.T) {
 		name    string
 		args    []string
 		wantErr bool
+		setup   func(t *testing.T)
 		check   func(t *testing.T, output []byte)
+		cleanup func(t *testing.T)
 	}{
 		{
 			name:    "Init vault",
@@ -50,7 +53,14 @@ func TestBosrCLI(t *testing.T) {
 			args:    []string{"open", vaultPath},
 			wantErr: false,
 			check: func(t *testing.T, output []byte) {
-				assert.Contains(t, string(output), "accessible", "Open output should indicate success")
+				outputStr := string(output)
+				assert.Contains(t, outputStr, "Key found in secret store", "Open output should indicate key was found")
+
+				// Check for either format of the success message
+				if !strings.Contains(outputStr, "Key verified and database accessible") &&
+					!strings.Contains(outputStr, "database file is accessible") {
+					assert.Fail(t, "Open output should indicate successful database access")
+				}
 			},
 		},
 		{
@@ -75,6 +85,7 @@ func TestBosrCLI(t *testing.T) {
 			wantErr: false,
 			check: func(t *testing.T, output []byte) {
 				assert.Contains(t, string(output), "Dry run completed", "Dry run output should indicate no changes")
+				assert.Contains(t, string(output), "Would re-encrypt", "Dry run should list keys that would be re-encrypted")
 			},
 		},
 		{
@@ -82,7 +93,10 @@ func TestBosrCLI(t *testing.T) {
 			args:    []string{"key", "rotate", vaultPath},
 			wantErr: false,
 			check: func(t *testing.T, output []byte) {
-				assert.Contains(t, string(output), "completed", "Rotate output should indicate success")
+				outputStr := string(output)
+				assert.Contains(t, outputStr, "Retrieved current master key", "Rotation should retrieve the current key")
+				assert.Contains(t, outputStr, "Generated new master key", "Rotation should generate a new key")
+				assert.Contains(t, outputStr, "Key rotation completed successfully", "Rotate output should indicate successful completion")
 			},
 		},
 		{
@@ -93,22 +107,52 @@ func TestBosrCLI(t *testing.T) {
 				assert.Equal(t, "test_value\n", string(output), "Get output after rotation should still be the stored value")
 			},
 		},
+		{
+			name:    "Open vault after rotation",
+			args:    []string{"open", vaultPath},
+			wantErr: false,
+			check: func(t *testing.T, output []byte) {
+				outputStr := string(output)
+				assert.Contains(t, outputStr, "Key found in secret store", "Open output should indicate key was found")
+
+				// Check for either format of the success message
+				if !strings.Contains(outputStr, "Key verified and database accessible") &&
+					!strings.Contains(outputStr, "database file is accessible") {
+					assert.Fail(t, "Open output should indicate successful database access")
+				}
+			},
+		},
 	}
 
 	// Run the test cases in sequence
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
+			// Run setup if provided
+			if tc.setup != nil {
+				tc.setup(t)
+			}
+
+			// Run the command
 			cmd := exec.Command(bosrPath, tc.args...)
 			output, err := cmd.CombinedOutput()
+			outputStr := string(output)
 
 			if tc.wantErr {
 				assert.Error(t, err, "Expected error but got none")
 			} else {
-				assert.NoError(t, err, "Unexpected error: %v\nOutput: %s", err, output)
+				if err != nil {
+					t.Logf("Command output: %s", outputStr)
+				}
+				assert.NoError(t, err, "Unexpected error: %v\nOutput: %s", err, outputStr)
 			}
 
 			if tc.check != nil {
 				tc.check(t, output)
+			}
+
+			// Run cleanup if provided
+			if tc.cleanup != nil {
+				tc.cleanup(t)
 			}
 		})
 	}

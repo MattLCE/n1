@@ -1,10 +1,15 @@
 package main
 
 import (
+	"bufio"
+	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
+	"syscall"
 
 	// Internal packages
 	"github.com/n1/n1/internal/crypto"
@@ -102,6 +107,17 @@ var initCmd = &cli.Command{
 			return fmt.Errorf("failed to initialize vault schema: %w", err)
 		}
 
+		// Add a canary record for key verification
+		secureDAO := dao.NewSecureVaultDAO(db, mk)
+		canaryKey := "__n1_canary__"
+		canaryPlaintext := []byte("ok")
+		if err := secureDAO.Put(canaryKey, canaryPlaintext); err != nil {
+			// If canary creation fails, clean up
+			_ = secretstore.Default.Delete(path)
+			return fmt.Errorf("failed to create canary record: %w", err)
+		}
+		log.Debug().Msg("Added canary record for key verification")
+
 		log.Info().Str("path", path).Msg("Plaintext vault file created and initialized")
 		return nil
 	},
@@ -121,29 +137,38 @@ var openCmd = &cli.Command{
 		}
 
 		// 1. Check if the key exists in the secret store
-		// We don't need the key contents for this check, just its presence.
-		_, err = secretstore.Default.Get(path)
+		mk, err := secretstore.Default.Get(path)
 		if err != nil {
 			return fmt.Errorf("failed to get key from secret store (does it exist?): %w", err)
 		}
 		log.Info().Str("path", path).Msg("Key found in secret store")
 
 		// 2. Try opening the plaintext DB file
-		db, err := sqlite.Open(path) // Correct: only path needed
+		db, err := sqlite.Open(path)
 		if err != nil {
 			return fmt.Errorf("failed to open database file '%s': %w", path, err)
 		}
-		// Ping is already done inside Open, but an extra one doesn't hurt
-		err = db.Ping()
-		if err != nil {
-			_ = db.Close()
-			return fmt.Errorf("failed to ping database '%s' after opening: %w", path, err)
-		}
 		defer db.Close() // Ensure DB is closed
 
-		// TODO: Later, add logic here to fetch key and attempt to decrypt a sample piece of data.
-		log.Info().Str("path", path).Msg("Vault check complete: Key exists and database file is accessible")
-		return nil
+		// 3. Verify the key can decrypt data in the vault
+		secureDAO := dao.NewSecureVaultDAO(db, mk)
+		canaryKey := "__n1_canary__"
+		plaintext, err := secureDAO.Get(canaryKey)
+
+		if err == nil && string(plaintext) == "ok" {
+			log.Info().Str("path", path).Msg("✓ Vault check complete: Key verified and database accessible.")
+			return nil
+		} else if errors.Is(err, dao.ErrNotFound) {
+			return fmt.Errorf("vault key found, but integrity check failed (canary missing). Vault may be incomplete or corrupt")
+		} else if err != nil {
+			// Check if it's a crypto error (decryption failure)
+			if strings.Contains(err.Error(), "failed to decrypt") {
+				return fmt.Errorf("vault key found, but decryption failed. Key may be incorrect or data corrupted")
+			}
+			return fmt.Errorf("vault check failed: %w", err)
+		}
+
+		return fmt.Errorf("vault check failed: unexpected canary value")
 	},
 }
 
@@ -183,27 +208,83 @@ var keyRotateCmd = &cli.Command{
 			fmt.Println("Running in dry-run mode - no changes will be made")
 		}
 
-		// 1. Get old key from store
-		oldMK, err := secretstore.Default.Get(path)
+		// 1. Pre-flight checks
+		originalPath := path
+		backupPath := originalPath + ".bak"
+		tempPath := originalPath + ".tmp"
+
+		// Check if backup or temp files already exist
+		if _, err := os.Stat(backupPath); err == nil {
+			return fmt.Errorf("backup file %s already exists; please remove it before proceeding", backupPath)
+		}
+		if _, err := os.Stat(tempPath); err == nil {
+			return fmt.Errorf("temporary file %s already exists; please remove it before proceeding", tempPath)
+		}
+
+		// Check original file exists
+		originalInfo, err := os.Stat(originalPath)
+		if err != nil {
+			return fmt.Errorf("cannot access original vault at %s: %w", originalPath, err)
+		}
+
+		// Check available disk space
+		originalSize := originalInfo.Size()
+		requiredSpace := originalSize * 3 // Original + backup + temp
+
+		// Get available disk space (platform-specific)
+		var stat syscall.Statfs_t
+		if err := syscall.Statfs(filepath.Dir(originalPath), &stat); err != nil {
+			log.Warn().Err(err).Msg("Could not check available disk space")
+		} else {
+			availableSpace := stat.Bavail * uint64(stat.Bsize)
+			if uint64(requiredSpace) > availableSpace {
+				return fmt.Errorf("insufficient disk space: need approximately %d bytes, have %d bytes available",
+					requiredSpace, availableSpace)
+			}
+		}
+
+		// Warn if file is large
+		if originalSize > 1024*1024*1024 { // 1GB
+			log.Warn().Int64("size_bytes", originalSize).Msg("Vault file is very large, rotation may take significant time and disk space")
+			fmt.Print("Vault file is large (>1GB). Continue with rotation? (y/N): ")
+			reader := bufio.NewReader(os.Stdin)
+			response, err := reader.ReadString('\n')
+			if err != nil {
+				return fmt.Errorf("failed to read user input: %w", err)
+			}
+			response = strings.TrimSpace(strings.ToLower(response))
+			if response != "y" && response != "yes" {
+				return fmt.Errorf("key rotation cancelled by user")
+			}
+		}
+
+		// 2. Get old key from store
+		oldMK, err := secretstore.Default.Get(originalPath)
 		if err != nil {
 			return fmt.Errorf("failed to get current key from secret store: %w", err)
 		}
 		log.Info().Msg("Retrieved current master key")
 
-		// 2. Open plaintext DB
-		db, err := sqlite.Open(path)
+		// 3. Generate new key
+		newMK, err := crypto.Generate(32)
 		if err != nil {
-			return fmt.Errorf("failed to open database file '%s': %w", path, err)
+			return fmt.Errorf("failed to generate new master key: %w", err)
 		}
-		defer db.Close()
-		log.Info().Str("path", path).Msg("Opened database file")
+		log.Info().Msg("Generated new master key")
 
-		// 3. Create a secure vault DAO with the old key
-		vault := dao.NewSecureVaultDAO(db, oldMK)
-
-		// 4. List all keys in the vault
-		keys, err := vault.List()
+		// Open original DB to list keys
+		originalDB, err := sqlite.Open(originalPath)
 		if err != nil {
+			return fmt.Errorf("failed to open database file '%s': %w", originalPath, err)
+		}
+
+		// Create a secure vault DAO with the old key
+		oldSecureDAO := dao.NewSecureVaultDAO(originalDB, oldMK)
+
+		// List all keys in the vault
+		keys, err := oldSecureDAO.List()
+		if err != nil {
+			originalDB.Close()
 			return fmt.Errorf("failed to list vault keys: %w", err)
 		}
 		log.Info().Int("count", len(keys)).Msg("Found keys in vault")
@@ -214,56 +295,174 @@ var keyRotateCmd = &cli.Command{
 			for _, k := range keys {
 				log.Info().Str("key", k).Msg("Would re-encrypt")
 			}
+			originalDB.Close()
 			log.Info().Msg("Dry run completed successfully. No changes were made.")
 			return nil
 		}
 
-		// 5. Generate new key
-		newMK, err := crypto.Generate(32)
-		if err != nil {
-			return fmt.Errorf("failed to generate new master key: %w", err)
-		}
-		log.Info().Msg("Generated new master key")
+		// Close the original DB before copying
+		originalDB.Close()
 
-		// 6. Re-encrypt all values with the new key
-		log.Info().Msg("Re-encrypting vault data...")
-		for i, k := range keys {
-			if i%10 == 0 || i == len(keys)-1 {
-				log.Debug().Int("progress", i+1).Int("total", len(keys)).Msg("Re-encryption progress")
+		// 4. Create backup
+		log.Info().Str("backup_path", backupPath).Msg("Creating backup of original vault...")
+		if err := copyFile(originalPath, backupPath); err != nil {
+			return fmt.Errorf("failed to create backup: %w", err)
+		}
+		log.Info().Msg("Backup created successfully")
+
+		// Function to clean up on failure
+		cleanup := func(keepBackup bool) {
+			log.Debug().Msg("Running cleanup...")
+			if _, err := os.Stat(tempPath); err == nil {
+				if err := os.Remove(tempPath); err != nil {
+					log.Warn().Err(err).Str("path", tempPath).Msg("Failed to remove temporary file during cleanup")
+				} else {
+					log.Debug().Str("path", tempPath).Msg("Removed temporary file")
+				}
 			}
 
+			if !keepBackup {
+				if _, err := os.Stat(backupPath); err == nil {
+					if err := os.Remove(backupPath); err != nil {
+						log.Warn().Err(err).Str("path", backupPath).Msg("Failed to remove backup file during cleanup")
+					} else {
+						log.Debug().Str("path", backupPath).Msg("Removed backup file")
+					}
+				}
+			}
+		}
+
+		// 5. Setup temp DB
+		log.Info().Str("temp_path", tempPath).Msg("Creating temporary database...")
+		tempDB, err := sqlite.Open(tempPath)
+		if err != nil {
+			cleanup(true) // Keep backup on failure
+			return fmt.Errorf("failed to create temporary database: %w", err)
+		}
+
+		// Initialize schema in temp DB
+		if err := migrations.BootstrapVault(tempDB); err != nil {
+			tempDB.Close()
+			cleanup(true) // Keep backup on failure
+			return fmt.Errorf("failed to initialize schema in temporary database: %w", err)
+		}
+
+		// 6. Open original DB again
+		originalDB, err = sqlite.Open(originalPath)
+		if err != nil {
+			tempDB.Close()
+			cleanup(true) // Keep backup on failure
+			return fmt.Errorf("failed to reopen original database: %w", err)
+		}
+
+		// 7. Migrate data with progress
+		log.Info().Msg("Migrating data to temporary database with new key...")
+		oldSecureDAO = dao.NewSecureVaultDAO(originalDB, oldMK)
+		tempRawDAO := dao.NewVaultDAO(tempDB)
+
+		for i, k := range keys {
+			// Show progress
+			log.Info().Msgf("Migrating data... %d / %d", i+1, len(keys))
+
 			// Get and decrypt with old key
-			plaintext, err := vault.Get(k)
+			plaintext, err := oldSecureDAO.Get(k)
 			if err != nil {
+				originalDB.Close()
+				tempDB.Close()
+				cleanup(true) // Keep backup on failure
 				return fmt.Errorf("failed to get value for key %s during rotation: %w", k, err)
 			}
 
 			// Encrypt with new key
-			ciphertext, err := crypto.EncryptBlob(newMK, plaintext)
+			newCiphertext, err := crypto.EncryptBlob(newMK, plaintext)
 			if err != nil {
+				originalDB.Close()
+				tempDB.Close()
+				cleanup(true) // Keep backup on failure
 				return fmt.Errorf("failed to encrypt value for key %s during rotation: %w", k, err)
 			}
 
-			// Update the record directly
-			_, err = db.Exec(
-				"UPDATE vault SET value = ? WHERE key = ?",
-				ciphertext, k,
-			)
+			// Store in temp DB
+			err = tempRawDAO.Put(k, newCiphertext)
 			if err != nil {
-				return fmt.Errorf("failed to update value for key %s during rotation: %w", k, err)
+				originalDB.Close()
+				tempDB.Close()
+				cleanup(true) // Keep backup on failure
+				return fmt.Errorf("failed to store value for key %s in temporary database: %w", k, err)
 			}
 		}
-		log.Info().Int("count", len(keys)).Msg("Re-encrypted keys")
 
-		// 7. Update key in secret store
-		if err := secretstore.Default.Put(path, newMK); err != nil {
-			return fmt.Errorf("failed to store new master key: %w", err)
+		// 8. Close DBs
+		originalDB.Close()
+		tempDB.Close()
+		log.Info().Msg("Data migration completed successfully")
+
+		// 9. Update key store
+		log.Info().Msg("Updating key store with new master key...")
+		if err := secretstore.Default.Put(originalPath, newMK); err != nil {
+			cleanup(true) // Keep backup on failure
+			return fmt.Errorf("failed to update master key in secret store: %w", err)
 		}
-		log.Info().Msg("Updated master key in secret store")
+		log.Info().Msg("Key store updated successfully")
 
+		// 10. Atomic replace
+		log.Info().Msg("Replacing original vault with new vault...")
+		if err := os.Rename(tempPath, originalPath); err != nil {
+			// Critical failure: key store has new key but original DB is still old
+			log.Error().Err(err).Msg("CRITICAL: Failed to replace original vault with new vault")
+			log.Error().Msg("The key store has been updated with the new key, but the rename operation failed.")
+			log.Error().Msgf("You need to manually rename %s to %s", tempPath, originalPath)
+			return fmt.Errorf("failed to replace original vault with new vault: %w", err)
+		}
+
+		// 11. Delete backup
+		log.Info().Msg("Removing backup file...")
+		if err := os.Remove(backupPath); err != nil {
+			log.Warn().Err(err).Msg("Failed to remove backup file, but key rotation was successful")
+			log.Warn().Msgf("You may want to manually remove the backup file: %s", backupPath)
+		}
+
+		// 12. Report success
 		log.Info().Msg("Key rotation completed successfully")
 		return nil
 	},
+}
+
+// Helper function to copy a file
+func copyFile(src, dst string) error {
+	sourceFile, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("failed to open source file: %w", err)
+	}
+	defer sourceFile.Close()
+
+	destFile, err := os.Create(dst)
+	if err != nil {
+		return fmt.Errorf("failed to create destination file: %w", err)
+	}
+	defer destFile.Close()
+
+	buf := make([]byte, 1024*1024) // 1MB buffer
+	for {
+		n, err := sourceFile.Read(buf)
+		if err != nil && err != io.EOF {
+			return fmt.Errorf("error reading from source file: %w", err)
+		}
+		if n == 0 {
+			break
+		}
+
+		if _, err := destFile.Write(buf[:n]); err != nil {
+			return fmt.Errorf("error writing to destination file: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// Helper function to create a SecureVaultDAO
+func NewSecureVaultDAO(db *sql.DB, key []byte) *dao.SecureVaultDAO {
+	return dao.NewSecureVaultDAO(db, key)
 }
 
 var putCmd = &cli.Command{
