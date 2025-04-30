@@ -1,6 +1,10 @@
 run:
   timeout: 3m
-  skip-dirs:
+
+# issues configuration
+issues:
+  # Exclude directories for analysis
+  exclude-dirs:
     - .devcontainer
 
 linters:
@@ -14,5 +18,3 @@ linters:
 linters-settings:
   revive:
     ignore-generated-header: true
-  govet:
-    check-shadowing: true

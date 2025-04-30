@@ -68,7 +68,7 @@ var initCmd = &cli.Command{
 		}
 
 		// 2· persist in secret store
-		if err := secretstore.Default.Put(path, mk); err != nil {
+		if err = secretstore.Default.Put(path, mk); err != nil {
 			// Consider if we should attempt cleanup if this fails
 			return fmt.Errorf("failed to store master key: %w", err)
 		}
