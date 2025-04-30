@@ -2,6 +2,7 @@
 
 # This script dumps the content of all files TRACKED by Git (respecting .gitignore)
 # into workspace_dump.txt in the current directory, prefixed with a timestamp.
+# run with bash dump_workspace.sh -> see results in workspace_dump.txt
 
 OUTPUT_FILE="workspace_dump.txt"
 
