@@ -96,7 +96,11 @@ func (r *Runner) Run() error {
 
 		// Execute migration SQL
 		if _, err := tx.Exec(migration.SQL); err != nil {
-			tx.Rollback()
+			rollbackErr := tx.Rollback()
+			if rollbackErr != nil {
+				return fmt.Errorf("failed to execute migration %d and rollback failed: %v: %w",
+					migration.Version, rollbackErr, err)
+			}
 			return fmt.Errorf("failed to execute migration %d: %w", migration.Version, err)
 		}
 
@@ -108,7 +112,11 @@ func (r *Runner) Run() error {
 			time.Now().UTC(),
 		)
 		if err != nil {
-			tx.Rollback()
+			rollbackErr := tx.Rollback()
+			if rollbackErr != nil {
+				return fmt.Errorf("failed to record migration %d and rollback failed: %v: %w",
+					migration.Version, rollbackErr, err)
+			}
 			return fmt.Errorf("failed to record migration %d: %w", migration.Version, err)
 		}
 
