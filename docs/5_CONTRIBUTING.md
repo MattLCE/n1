@@ -110,7 +110,13 @@ Before submitting changes, please run the following checks locally:
 4.  **Ensure CI Passes:** GitHub Actions will automatically run the build, lint, and test suite. All checks must pass before the PR can be merged. Address any reported failures.
 5.  **Code Review:** Project maintainers will review your PR. Be responsive to feedback and engage in discussion. Updates to your branch will automatically update the PR.
 6.  **Merge:** Once approved and CI passes, a maintainer will merge your PR. Congratulations and thank you!
-
+7.  **Cleanup:** In your local dev environment, trying to sync on the deleted branch will cause an error. 1 Make sure you're not on the branch you're about to delete. 2 Tell your local Git to update its knowledge of the remote repository and remove references to any remote branches that no longer exist. 3 Ensure your local main branch is up-to-date. 4 Now that it's merged and the remote is gone, you can safely delete the local copy. Use -d (lowercase) for safe deletion - Git will only delete it if it's fully merged into main. If for some reason Git complains it's not merged (unlikely here), you could force delete with -D, but be cautious.
+    ```bash
+    git switch main
+    git fetch --prune
+    git pull origin main
+    git branch -d my-new-feature
+    ```
 ## Reporting Issues
 
 If you find a bug, have a question, or want to suggest a feature, please open an issue on the [GitHub Issues page](https://github.com/n1/n1/issues). Provide as much detail as possible, including steps to reproduce if reporting a bug.
