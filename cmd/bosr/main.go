@@ -1,19 +1,21 @@
 package main
 
 import (
+	"errors"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 
-	// Assuming these are still needed for key generation and storage
+	// Internal packages
 	"github.com/n1/n1/internal/crypto"
+	"github.com/n1/n1/internal/dao"
+	"github.com/n1/n1/internal/log"
+	"github.com/n1/n1/internal/migrations"
 	"github.com/n1/n1/internal/secretstore"
-
-	// Uses the updated sqlite package
 	"github.com/n1/n1/internal/sqlite"
 
-	"github.com/urfave/cli/v2" // Assuming CLI library is still used
+	"github.com/rs/zerolog"
+	"github.com/urfave/cli/v2"
 )
 
 const version = "0.0.1-dev"
@@ -27,14 +29,22 @@ func main() {
 			initCmd,
 			openCmd,
 			keyCmd, // Keep the top-level key command structure
+			putCmd,
+			getCmd,
 		},
 	}
 
-	// Consider using a structured logger later, e.g., from internal/log
-	log.SetFlags(0) // Remove timestamp prefix from standard logger
+	// Configure logging
+	if os.Getenv("DEBUG") == "1" {
+		log.SetLevel(zerolog.DebugLevel)
+		log.EnableConsoleOutput()
+		log.Debug().Msg("Debug logging enabled")
+	} else {
+		log.SetLevel(zerolog.InfoLevel)
+	}
 
 	if err := app.Run(os.Args); err != nil {
-		log.Fatalf("Error: %v", err) // Print error more clearly
+		log.Fatal().Err(err).Msg("Application error")
 	}
 }
 
@@ -72,25 +82,27 @@ var initCmd = &cli.Command{
 			// Consider if we should attempt cleanup if this fails
 			return fmt.Errorf("failed to store master key: %w", err)
 		}
-		fmt.Printf("✓ Master key generated and stored for %s\n", path)
+		log.Info().Str("path", path).Msg("Master key generated and stored")
 
 		// 3· create *plaintext* DB file by opening it
 		// The Open function now only takes the path.
 		db, err := sqlite.Open(path)
 		if err != nil {
 			// If DB creation fails, should we remove the key we just stored?
-			// _ = secretstore.Default.Delete(path) // Optional cleanup
+			_ = secretstore.Default.Delete(path) // Cleanup key if DB creation fails
 			return fmt.Errorf("failed to create database file '%s': %w", path, err)
 		}
 		defer db.Close() // Ensure DB is closed
 
-		// Optional: Initialize minimal schema if needed?
-		// _, err = db.Exec(`CREATE TABLE IF NOT EXISTS some_initial_table (...)`)
-		// if err != nil {
-		// 	return fmt.Errorf("failed to initialize schema: %w", err)
-		// }
+		// 4· Run migrations to bootstrap the vault table
+		log.Info().Msg("Running migrations to initialize vault schema...")
+		if err := migrations.BootstrapVault(db); err != nil {
+			// If migrations fail, clean up
+			_ = secretstore.Default.Delete(path)
+			return fmt.Errorf("failed to initialize vault schema: %w", err)
+		}
 
-		fmt.Printf("✓ Plaintext vault file created: %s\n", path)
+		log.Info().Str("path", path).Msg("Plaintext vault file created and initialized")
 		return nil
 	},
 }
@@ -114,7 +126,7 @@ var openCmd = &cli.Command{
 		if err != nil {
 			return fmt.Errorf("failed to get key from secret store (does it exist?): %w", err)
 		}
-		fmt.Printf("✓ Key found in secret store for %s\n", path)
+		log.Info().Str("path", path).Msg("Key found in secret store")
 
 		// 2. Try opening the plaintext DB file
 		db, err := sqlite.Open(path) // Correct: only path needed
@@ -130,7 +142,7 @@ var openCmd = &cli.Command{
 		defer db.Close() // Ensure DB is closed
 
 		// TODO: Later, add logic here to fetch key and attempt to decrypt a sample piece of data.
-		fmt.Printf("✓ Vault check complete: Key exists and database file '%s' is accessible.\n", path)
+		log.Info().Str("path", path).Msg("Vault check complete: Key exists and database file is accessible")
 		return nil
 	},
 }
@@ -145,42 +157,198 @@ var keyCmd = &cli.Command{
 	},
 }
 
-// Stub out key rotation - Requires complete redesign
+// Key rotation implementation
 var keyRotateCmd = &cli.Command{
 	Name:      "rotate",
-	Usage:     "rotate <vault.db>  – [NOT IMPLEMENTED] create new key & re-encrypt data",
+	Usage:     "rotate <vault.db>  – create new key & re-encrypt data",
 	ArgsUsage: "<path>",
+	Flags: []cli.Flag{
+		&cli.BoolFlag{
+			Name:  "dry-run",
+			Usage: "Simulate key rotation without making changes",
+			Value: false,
+		},
+	},
 	Action: func(c *cli.Context) error {
 		if c.NArg() != 1 {
-			return cli.Exit("Usage: key rotate <vault.db>", 1)
+			return cli.Exit("Usage: key rotate [--dry-run] <vault.db>", 1)
 		}
-		// path, err := filepath.Abs(c.Args().First())
-		// if err != nil {
-		//    return fmt.Errorf("failed to get absolute path: %w", err)
-		// }
+		path, err := filepath.Abs(c.Args().First())
+		if err != nil {
+			return fmt.Errorf("failed to get absolute path: %w", err)
+		}
 
-		// --- The old logic below is completely wrong for application-level encryption ---
-		// oldMK, err := secretstore.Default.Get(path)
-		// if err != nil { return err }
-		// db, err := sqlite.Open(path) // Open plaintext
-		// if err != nil { return err }
-		// defer db.Close()
-		// newMK, _ := crypto.Generate(32)
-		// // PRAGMA rekey DOES NOT WORK on plaintext DBs or with application encryption
-		// // if _, err := db.Exec(fmt.Sprintf("PRAGMA rekey = \"x'%x'\";", newMK)); err != nil { return err }
-		// if err := secretstore.Default.Put(path, newMK); err != nil { return err }
-		// fmt.Println("✓ key rotated")
+		dryRun := c.Bool("dry-run")
+		if dryRun {
+			fmt.Println("Running in dry-run mode - no changes will be made")
+		}
 
-		// TODO: Implement application-level rotation:
-		// 1. Get old key from store.
-		// 2. Open plaintext DB.
-		// 3. Generate new key.
-		// 4. Read ALL encrypted data fields.
-		// 5. Decrypt using OLD key.
-		// 6. Re-encrypt using NEW key.
-		// 7. Write re-encrypted data back.
-		// 8. Update key in secret store.
-		// This needs careful transaction handling.
-		return fmt.Errorf("key rotation is not implemented for application-level encryption yet")
+		// 1. Get old key from store
+		oldMK, err := secretstore.Default.Get(path)
+		if err != nil {
+			return fmt.Errorf("failed to get current key from secret store: %w", err)
+		}
+		log.Info().Msg("Retrieved current master key")
+
+		// 2. Open plaintext DB
+		db, err := sqlite.Open(path)
+		if err != nil {
+			return fmt.Errorf("failed to open database file '%s': %w", path, err)
+		}
+		defer db.Close()
+		log.Info().Str("path", path).Msg("Opened database file")
+
+		// 3. Create a secure vault DAO with the old key
+		vault := dao.NewSecureVaultDAO(db, oldMK)
+
+		// 4. List all keys in the vault
+		keys, err := vault.List()
+		if err != nil {
+			return fmt.Errorf("failed to list vault keys: %w", err)
+		}
+		log.Info().Int("count", len(keys)).Msg("Found keys in vault")
+
+		if dryRun {
+			// In dry-run mode, just list the keys that would be re-encrypted
+			log.Info().Msg("The following keys would be re-encrypted:")
+			for _, k := range keys {
+				log.Info().Str("key", k).Msg("Would re-encrypt")
+			}
+			log.Info().Msg("Dry run completed successfully. No changes were made.")
+			return nil
+		}
+
+		// 5. Generate new key
+		newMK, err := crypto.Generate(32)
+		if err != nil {
+			return fmt.Errorf("failed to generate new master key: %w", err)
+		}
+		log.Info().Msg("Generated new master key")
+
+		// 6. Re-encrypt all values with the new key
+		log.Info().Msg("Re-encrypting vault data...")
+		for i, k := range keys {
+			if i%10 == 0 || i == len(keys)-1 {
+				log.Debug().Int("progress", i+1).Int("total", len(keys)).Msg("Re-encryption progress")
+			}
+
+			// Get and decrypt with old key
+			plaintext, err := vault.Get(k)
+			if err != nil {
+				return fmt.Errorf("failed to get value for key %s during rotation: %w", k, err)
+			}
+
+			// Encrypt with new key
+			ciphertext, err := crypto.EncryptBlob(newMK, plaintext)
+			if err != nil {
+				return fmt.Errorf("failed to encrypt value for key %s during rotation: %w", k, err)
+			}
+
+			// Update the record directly
+			_, err = db.Exec(
+				"UPDATE vault SET value = ? WHERE key = ?",
+				ciphertext, k,
+			)
+			if err != nil {
+				return fmt.Errorf("failed to update value for key %s during rotation: %w", k, err)
+			}
+		}
+		log.Info().Int("count", len(keys)).Msg("Re-encrypted keys")
+
+		// 7. Update key in secret store
+		if err := secretstore.Default.Put(path, newMK); err != nil {
+			return fmt.Errorf("failed to store new master key: %w", err)
+		}
+		log.Info().Msg("Updated master key in secret store")
+
+		log.Info().Msg("Key rotation completed successfully")
+		return nil
+	},
+}
+
+var putCmd = &cli.Command{
+	Name:      "put",
+	Usage:     "put <vault.db> <key> <value>  – store an encrypted value",
+	ArgsUsage: "<path> <key> <value>",
+	Action: func(c *cli.Context) error {
+		if c.NArg() != 3 {
+			return cli.Exit("Usage: put <vault.db> <key> <value>", 1)
+		}
+		path, err := filepath.Abs(c.Args().First())
+		if err != nil {
+			return fmt.Errorf("failed to get absolute path: %w", err)
+		}
+		key := c.Args().Get(1)
+		value := c.Args().Get(2)
+
+		// 1. Get the master key from the secret store
+		mk, err := secretstore.Default.Get(path)
+		if err != nil {
+			return fmt.Errorf("failed to get key from secret store: %w", err)
+		}
+
+		// 2. Open the database
+		db, err := sqlite.Open(path)
+		if err != nil {
+			return fmt.Errorf("failed to open database file '%s': %w", path, err)
+		}
+		defer db.Close()
+
+		// 3. Create a secure vault DAO
+		vault := dao.NewSecureVaultDAO(db, mk)
+
+		// 4. Store the value
+		if err := vault.Put(key, []byte(value)); err != nil {
+			return fmt.Errorf("failed to store value: %w", err)
+		}
+
+		log.Info().Str("key", key).Msg("Value stored successfully")
+		return nil
+	},
+}
+
+var getCmd = &cli.Command{
+	Name:      "get",
+	Usage:     "get <vault.db> <key>  – retrieve an encrypted value",
+	ArgsUsage: "<path> <key>",
+	Action: func(c *cli.Context) error {
+		if c.NArg() != 2 {
+			return cli.Exit("Usage: get <vault.db> <key>", 1)
+		}
+		path, err := filepath.Abs(c.Args().First())
+		if err != nil {
+			return fmt.Errorf("failed to get absolute path: %w", err)
+		}
+		key := c.Args().Get(1)
+
+		// 1. Get the master key from the secret store
+		mk, err := secretstore.Default.Get(path)
+		if err != nil {
+			return fmt.Errorf("failed to get key from secret store: %w", err)
+		}
+
+		// 2. Open the database
+		db, err := sqlite.Open(path)
+		if err != nil {
+			return fmt.Errorf("failed to open database file '%s': %w", path, err)
+		}
+		defer db.Close()
+
+		// 3. Create a secure vault DAO
+		vault := dao.NewSecureVaultDAO(db, mk)
+
+		// 4. Retrieve the value
+		value, err := vault.Get(key)
+		if err != nil {
+			if errors.Is(err, dao.ErrNotFound) {
+				return fmt.Errorf("key '%s' not found", key)
+			}
+			return fmt.Errorf("failed to retrieve value: %w", err)
+		}
+
+		// Still print the value to stdout for CLI usage
+		fmt.Printf("%s\n", string(value))
+		log.Debug().Str("key", key).Int("value_size", len(value)).Msg("Value retrieved successfully")
+		return nil
 	},
 }
