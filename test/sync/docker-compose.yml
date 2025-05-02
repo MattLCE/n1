@@ -1,0 +1,60 @@
+version: '3'
+
+services:
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.5.0
+    ports:
+      - "8474:8474"  # Control API
+      - "7000-7010:7000-7010"  # Range for proxied ports
+    networks:
+      - test-net
+
+  vault1:
+    build:
+      context: ../..
+      dockerfile: test/sync/Dockerfile
+    volumes:
+      - ./data/vault1:/data
+    environment:
+      - N1_NODE_ID=vault1
+      - N1_LISTEN_ADDR=0.0.0.0:7001
+      - N1_TOXIPROXY_ADDR=toxiproxy:8474
+    depends_on:
+      - toxiproxy
+    networks:
+      - test-net
+
+  vault2:
+    build:
+      context: ../..
+      dockerfile: test/sync/Dockerfile
+    volumes:
+      - ./data/vault2:/data
+    environment:
+      - N1_NODE_ID=vault2
+      - N1_LISTEN_ADDR=0.0.0.0:7002
+      - N1_TOXIPROXY_ADDR=toxiproxy:8474
+    depends_on:
+      - toxiproxy
+    networks:
+      - test-net
+
+  test-runner:
+    build:
+      context: ../..
+      dockerfile: test/sync/Dockerfile.test
+    volumes:
+      - ./:/test
+    environment:
+      - N1_TOXIPROXY_ADDR=toxiproxy:8474
+      - N1_VAULT1_ADDR=vault1:7001
+      - N1_VAULT2_ADDR=vault2:7002
+    depends_on:
+      - vault1
+      - vault2
+    networks:
+      - test-net
+
+networks:
+  test-net:
+    driver: bridge
