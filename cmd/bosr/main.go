@@ -36,6 +36,7 @@ func main() {
 			keyCmd, // Keep the top-level key command structure
 			putCmd,
 			getCmd,
+			syncCmd, // Add the sync command
 		},
 	}
 
