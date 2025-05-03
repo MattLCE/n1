@@ -22,3 +22,6 @@ go.work
 
 # Dump
 workspace_dump.txt
+
+# Binary output directory
+bin/
