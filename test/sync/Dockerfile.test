@@ -2,8 +2,9 @@ FROM golang:1.23-alpine
 
 WORKDIR /app
 
-# Install required tools
-RUN apk add --no-cache curl jq bash
+# Install required tools AND C build tools
+# ---> Added build-base here <---
+RUN apk add --no-cache curl jq bash build-base
 
 # Copy go.mod and go.sum
 COPY go.mod go.sum ./
@@ -12,11 +13,11 @@ RUN go mod download
 # Copy the source code
 COPY . .
 
-# Build the test runner
+# Build the test runner (needs build-base for CGO)
 RUN CGO_ENABLED=1 GOOS=linux go test -c -o /app/bin/sync.test ./test/sync
 
-# Create test directory
+# Create test directory (optional,WORKDIR /test might not be strictly needed depending on test execution)
 WORKDIR /test
 
-# Default command
+# Default command (This will likely be overridden by the command in your Makefile's docker compose run target)
 CMD ["sh", "-c", "/app/bin/sync.test -test.v"]

@@ -21,18 +21,24 @@ clean:
 # Network testing targets
 test-net-build:
 	mkdir -p test/sync/data/vault1 test/sync/data/vault2
-	docker-compose -f test/sync/docker-compose.yml build
+	# Changed docker-compose to docker compose
+	docker compose -f test/sync/docker-compose.yml build
 
 test-net-clean:
-	docker-compose -f test/sync/docker-compose.yml down -v
+	# Changed docker-compose to docker compose
+	docker compose -f test/sync/docker-compose.yml down -v
 	rm -rf test/sync/data
 
 test-net: test-net-build
-	docker-compose -f test/sync/docker-compose.yml up --abort-on-container-exit test-runner
+	# Changed docker-compose to docker compose
+	docker compose -f test/sync/docker-compose.yml up --abort-on-container-exit test-runner
 	@echo "Network tests completed"
 
 # Run a specific network test
 test-net-%: test-net-build
-	docker-compose -f test/sync/docker-compose.yml up -d toxiproxy vault1 vault2
-	docker-compose -f test/sync/docker-compose.yml run test-runner /app/bin/sync.test -test.v -test.run $*
-	docker-compose -f test/sync/docker-compose.yml down
+	# Changed docker-compose to docker compose
+	docker compose -f test/sync/docker-compose.yml up -d toxiproxy vault1 vault2
+	# Changed docker-compose to docker compose
+	docker compose -f test/sync/docker-compose.yml run test-runner /app/bin/sync.test -test.v -test.run $*
+	# Changed docker-compose to docker compose
+	docker compose -f test/sync/docker-compose.yml down
