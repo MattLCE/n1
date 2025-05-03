@@ -238,9 +238,6 @@ func (c *ToxiproxyClient) ApplyNetworkProfile(proxyName string, profile NetworkP
 
 // TestSyncWithNetworkProfiles tests synchronization with different network profiles
 func TestSyncWithNetworkProfiles(t *testing.T) {
-	// Skip this test for now as we're implementing milestone_1
-	t.Skip("Skipping network profile test for milestone_1 implementation")
-
 	// Get environment variables
 	vault1Addr := os.Getenv("N1_VAULT1_ADDR")
 	if vault1Addr == "" {
@@ -277,13 +274,22 @@ func TestSyncWithNetworkProfiles(t *testing.T) {
 			require.NoError(t, err, "Failed to apply network profile")
 
 			// Create test data directory
-			testDir := filepath.Join(os.TempDir(), fmt.Sprintf("n1-sync-test-%s", profile.Name))
-			err = os.MkdirAll(testDir, 0755)
-			require.NoError(t, err, "Failed to create test directory")
-			defer os.RemoveAll(testDir)
+			// Define vault paths relative to the test-runner container's mount point (/test)
+			// These correspond to /data/vault.db inside the vault1/vault2 containers
+			vault1Path := "/test/test/sync/data/vault1/vault.db"
+			vault2Path := "/test/test/sync/data/vault2/vault.db"
+
+			// Ensure parent directories exist (needed because init doesn't create them)
+			err = os.MkdirAll(filepath.Dir(vault1Path), 0755)
+			require.NoError(t, err, "Failed to create directory for vault1")
+			err = os.MkdirAll(filepath.Dir(vault2Path), 0755)
+			require.NoError(t, err, "Failed to create directory for vault2")
+
+			// Clean up existing vault files if they exist from previous runs
+			os.Remove(vault1Path)
+			os.Remove(vault2Path)
 
 			// Initialize vault1
-			vault1Path := filepath.Join(testDir, "vault1.db")
 			cmd := exec.Command("bosr", "init", vault1Path)
 			output, err := cmd.CombinedOutput()
 			require.NoError(t, err, "Failed to initialize vault1: %s", output)
@@ -298,27 +304,33 @@ func TestSyncWithNetworkProfiles(t *testing.T) {
 			}
 
 			// Initialize vault2
-			vault2Path := filepath.Join(testDir, "vault2.db")
 			cmd = exec.Command("bosr", "init", vault2Path)
 			output, err = cmd.CombinedOutput()
 			require.NoError(t, err, "Failed to initialize vault2: %s", output)
 
 			// Start sync from vault1 to vault2 (using the proxy)
+			// NOTE: The test runs 'bosr sync' which acts as a client.
+			// It connects to the 'mirord' server running in vault2 (via the proxy).
+			// Since vault1 is the client, it PULLS by default.
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 
-			cmd = exec.CommandContext(ctx, "bosr", "sync", vault1Path, fmt.Sprintf("toxiproxy:%s", proxyListen))
+			// Connect using the service name 'toxiproxy' and the port the proxy listens on, in the format expected by transport.go
+			// vault1 (client) pulls from vault2 (server via proxy)
+			cmd = exec.CommandContext(ctx, "bosr", "sync", vault1Path, "toxiproxy:toxiproxy:7010")
 			output, err = cmd.CombinedOutput()
-			require.NoError(t, err, "Sync failed: %s", output)
+			require.NoError(t, err, "Sync vault1<-vault2 failed: %s", output)
 
-			// Verify that vault2 has the data from vault1
+			// Verify that vault1 (which pulled) now has the data from vault2 (which was empty initially)
+			// This check seems wrong, vault1 should have its original data, vault2 should have vault1's data.
+			// Let's verify vault2 received vault1's data.
 			for i := 0; i < 10; i++ {
 				key := fmt.Sprintf("key%d", i)
 				expectedValue := fmt.Sprintf("value%d", i)
-				cmd := exec.Command("bosr", "get", vault2Path, key)
+				cmd := exec.Command("bosr", "get", vault2Path, key) // Check vault2
 				output, err := cmd.CombinedOutput()
 				require.NoError(t, err, "Failed to get data from vault2: %s", output)
-				assert.Equal(t, expectedValue, string(bytes.TrimSpace(output)), "Value mismatch for key %s", key)
+				assert.Equal(t, expectedValue, string(bytes.TrimSpace(output)), "Value mismatch for key %s in vault2", key)
 			}
 
 			// Add data to vault2
@@ -331,18 +343,20 @@ func TestSyncWithNetworkProfiles(t *testing.T) {
 			}
 
 			// Sync back from vault2 to vault1
+			// vault2 (client) pulls from vault1 (server)
+			// vault1Addr is defined in docker-compose env as vault1:7001
 			cmd = exec.CommandContext(ctx, "bosr", "sync", vault2Path, vault1Addr)
 			output, err = cmd.CombinedOutput()
-			require.NoError(t, err, "Sync failed: %s", output)
+			require.NoError(t, err, "Sync vault2<-vault1 failed: %s", output)
 
-			// Verify that vault1 has the data from vault2
+			// Verify that vault1 has the new data from vault2
 			for i := 10; i < 20; i++ {
 				key := fmt.Sprintf("key%d", i)
 				expectedValue := fmt.Sprintf("value%d", i)
-				cmd := exec.Command("bosr", "get", vault1Path, key)
+				cmd := exec.Command("bosr", "get", vault1Path, key) // Check vault1
 				output, err := cmd.CombinedOutput()
 				require.NoError(t, err, "Failed to get data from vault1: %s", output)
-				assert.Equal(t, expectedValue, string(bytes.TrimSpace(output)), "Value mismatch for key %s", key)
+				assert.Equal(t, expectedValue, string(bytes.TrimSpace(output)), "Value mismatch for key %s in vault1", key)
 			}
 
 			t.Logf("Sync test with %s profile completed successfully", profile.Name)
@@ -379,32 +393,39 @@ func TestSyncResumableWithNetworkInterruption(t *testing.T) {
 		}
 	}()
 
-	// Create test data directory
-	testDir := filepath.Join(os.TempDir(), "n1-sync-resumable-test")
-	err = os.MkdirAll(testDir, 0755)
-	require.NoError(t, err, "Failed to create test directory")
-	defer os.RemoveAll(testDir)
+	// Define vault paths relative to the test-runner container's mount point (/test)
+	vault1Path := "/test/test/sync/data/vault1/vault.db"
+	vault2Path := "/test/test/sync/data/vault2/vault.db"
+	largeFilePath := "/test/test/sync/data/large_file.bin" // Place large file in mounted dir too
+
+	// Ensure parent directories exist
+	err = os.MkdirAll(filepath.Dir(vault1Path), 0755)
+	require.NoError(t, err, "Failed to create directory for vault1")
+	err = os.MkdirAll(filepath.Dir(vault2Path), 0755)
+	require.NoError(t, err, "Failed to create directory for vault2")
+
+	// Clean up existing vault files if they exist
+	os.Remove(vault1Path)
+	os.Remove(vault2Path)
+	os.Remove(largeFilePath)
 
 	// Initialize vault1
-	vault1Path := filepath.Join(testDir, "vault1.db")
 	cmd := exec.Command("bosr", "init", vault1Path)
 	output, err := cmd.CombinedOutput()
 	require.NoError(t, err, "Failed to initialize vault1: %s", output)
 
 	// Create a large file (5MB) to add to vault1
-	largeFilePath := filepath.Join(testDir, "large_file.bin")
 	largeFile, err := os.Create(largeFilePath)
 	require.NoError(t, err, "Failed to create large file")
-	defer largeFile.Close()
 
-	// Fill the file with random data
+	// Fill the file with data
 	data := make([]byte, 5*1024*1024) // 5MB
 	for i := range data {
 		data[i] = byte(i % 256)
 	}
 	_, err = largeFile.Write(data)
 	require.NoError(t, err, "Failed to write to large file")
-	largeFile.Close()
+	largeFile.Close() // Close the file before putting it
 
 	// Add the large file to vault1
 	cmd = exec.Command("bosr", "put", vault1Path, "large_file", fmt.Sprintf("@%s", largeFilePath))
@@ -412,7 +433,6 @@ func TestSyncResumableWithNetworkInterruption(t *testing.T) {
 	require.NoError(t, err, "Failed to add large file to vault1: %s", output)
 
 	// Initialize vault2
-	vault2Path := filepath.Join(testDir, "vault2.db")
 	cmd = exec.Command("bosr", "init", vault2Path)
 	output, err = cmd.CombinedOutput()
 	require.NoError(t, err, "Failed to initialize vault2: %s", output)
@@ -470,14 +490,15 @@ func TestSyncResumableWithNetworkInterruption(t *testing.T) {
 	// Resume the sync
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	cmd = exec.CommandContext(ctx, "bosr", "sync", vault1Path, fmt.Sprintf("toxiproxy:%s", proxyListen))
+	// Connect using the service name 'toxiproxy' and the port the proxy listens on, in the format expected by transport.go
+	cmd = exec.CommandContext(ctx, "bosr", "sync", vault1Path, "toxiproxy:toxiproxy:7011") // Use port 7011 for this test
 	output, err = cmd.CombinedOutput()
 	require.NoError(t, err, "Resume sync failed: %s", output)
 
 	// Verify that vault2 has the large file
 	cmd = exec.Command("bosr", "get", vault2Path, "large_file")
 	output, err = cmd.CombinedOutput()
-	require.NoError(t, err, "Failed to get large file from vault2: %s", output)
+	require.NoError(t, err, "Failed to get large file from vault2 after resume: %s", output)
 	assert.Equal(t, len(data), len(output), "Large file size mismatch")
 
 	t.Log("Resumable sync test completed successfully")

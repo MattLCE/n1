@@ -118,6 +118,12 @@ func NewTCPTransport(peer string, config TransportConfig) (*TCPTransport, error)
 	}, nil
 }
 
+// SetConnection assigns an existing net.Conn to the transport.
+// Used on the server side after accepting a connection.
+func (t *TCPTransport) SetConnection(conn net.Conn) {
+	t.conn = conn
+}
+
 // Connect establishes a TCP connection to the peer.
 func (t *TCPTransport) Connect(ctx context.Context) error {
 	// Special handling for toxiproxy addresses

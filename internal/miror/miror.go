@@ -4,7 +4,9 @@
 package miror
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -396,65 +398,118 @@ func (r *Replicator) sync(ctx context.Context, peer string, config SyncConfig, p
 
 // performPush performs a push synchronization.
 func (r *Replicator) performPush(ctx context.Context, session *Session, transport Transport, progress ProgressCallback) error {
-	// For Milestone 1, we'll implement a simplified version that just pretends to push
-	// This is enough to make the tests pass
-
 	// Update session state
 	session.State = SessionStateOffering
+	defer func() {
+		if session.State != SessionStateClosed {
+			session.State = SessionStateError // Mark as error unless explicitly closed
+			session.EndTime = time.Now()
+		}
+		// TODO: Consider session cleanup (r.wal.CleanupSession(session.ID)) on error?
+	}()
 
 	// List objects to push
-	objects, err := r.objectStore.ListObjects(ctx)
+	localHashes, err := r.objectStore.ListObjects(ctx)
 	if err != nil {
-		session.State = SessionStateError
 		session.Error = err
-		session.EndTime = time.Now()
 		return fmt.Errorf("failed to list objects: %w", err)
+	}
+
+	// Send OFFER message
+	offerBody, err := EncodeOfferMessage(localHashes) // Use exported name
+	if err != nil {
+		session.Error = err
+		return fmt.Errorf("failed to encode OFFER message: %w", err)
+	}
+	if err := transport.Send(ctx, MessageTypeOffer, offerBody); err != nil {
+		session.Error = err
+		return fmt.Errorf("failed to send OFFER message: %w", err)
+	}
+
+	// Receive ACCEPT message
+	msgType, acceptBody, err := transport.Receive(ctx)
+	if err != nil {
+		session.Error = err
+		return fmt.Errorf("failed to receive ACCEPT message: %w", err)
+	}
+	if msgType != MessageTypeAccept {
+		// TODO: Handle potential ERROR message from peer
+		session.Error = fmt.Errorf("unexpected message type %x received, expected ACCEPT (%x)", msgType, MessageTypeAccept)
+		return session.Error
+	}
+
+	hashesToPush, err := DecodeAcceptMessage(acceptBody) // Use exported name
+	if err != nil {
+		session.Error = err
+		return fmt.Errorf("failed to decode ACCEPT message: %w", err)
+	}
+
+	if len(hashesToPush) == 0 {
+		// Nothing to push, send COMPLETE immediately
+		session.State = SessionStateCompleting
+		completeBody, err := EncodeCompleteMessage(session.ID) // Use exported name
+		if err != nil {
+			session.Error = err
+			return fmt.Errorf("failed to encode COMPLETE message: %w", err)
+		}
+		if err := transport.Send(ctx, MessageTypeComplete, completeBody); err != nil {
+			session.Error = err
+			return fmt.Errorf("failed to send COMPLETE message: %w", err)
+		}
+		session.State = SessionStateClosed
+		session.EndTime = time.Now()
+		return nil
 	}
 
 	// Update session state
 	session.State = SessionStateTransferring
 
-	// Simulate pushing objects
-	for i, hash := range objects {
+	// Send DATA messages for requested objects
+	totalToPush := int64(len(hashesToPush))
+	for i, hash := range hashesToPush {
 		// Check if the context is cancelled
 		if err := ctx.Err(); err != nil {
-			session.State = SessionStateError
 			session.Error = err
-			session.EndTime = time.Now()
 			return fmt.Errorf("sync cancelled: %w", err)
 		}
 
 		// Log the send operation
 		if err := r.wal.LogSend(session.ID, hash); err != nil {
-			session.State = SessionStateError
 			session.Error = err
-			session.EndTime = time.Now()
 			return fmt.Errorf("failed to log send: %w", err)
 		}
 
 		// Get the object data
 		data, err := r.objectStore.GetObject(ctx, hash)
 		if err != nil {
-			session.State = SessionStateError
 			session.Error = err
-			session.EndTime = time.Now()
 			return fmt.Errorf("failed to get object: %w", err)
+		}
+
+		// Send DATA message
+		// For M1, offset is always 0
+		dataBody, err := EncodeDataMessage(hash, 0, data) // Use exported name
+		if err != nil {
+			session.Error = err
+			return fmt.Errorf("failed to encode DATA message for %s: %w", hash, err)
+		}
+		if err := transport.Send(ctx, MessageTypeData, dataBody); err != nil {
+			session.Error = err
+			return fmt.Errorf("failed to send DATA message for %s: %w", hash, err)
+		}
+
+		// TODO: For M1, we skip waiting for ACK. In M2, wait for ACK here.
+
+		// Complete the transfer in WAL
+		if err := r.wal.CompleteTransfer(session.ID, hash); err != nil {
+			// Log error but try to continue if possible? Or fail hard? Fail hard for now.
+			session.Error = err
+			return fmt.Errorf("failed to complete transfer for %s: %w", hash, err)
 		}
 
 		// Report progress
 		if progress != nil {
-			progress(int64(i+1), int64(len(objects)), hash)
-		}
-
-		// Simulate sending the object
-		time.Sleep(10 * time.Millisecond)
-
-		// Complete the transfer
-		if err := r.wal.CompleteTransfer(session.ID, hash); err != nil {
-			session.State = SessionStateError
-			session.Error = err
-			session.EndTime = time.Now()
-			return fmt.Errorf("failed to complete transfer: %w", err)
+			progress(int64(i+1), totalToPush, hash)
 		}
 
 		// Update session stats
@@ -464,6 +519,17 @@ func (r *Replicator) performPush(ctx context.Context, session *Session, transpor
 
 	// Update session state
 	session.State = SessionStateCompleting
+
+	// Send COMPLETE message
+	completeBody, err := EncodeCompleteMessage(session.ID) // Use exported name
+	if err != nil {
+		session.Error = err
+		return fmt.Errorf("failed to encode COMPLETE message: %w", err)
+	}
+	if err := transport.Send(ctx, MessageTypeComplete, completeBody); err != nil {
+		session.Error = err
+		return fmt.Errorf("failed to send COMPLETE message: %w", err)
+	}
 
 	// Complete the session
 	session.State = SessionStateClosed
@@ -474,62 +540,163 @@ func (r *Replicator) performPush(ctx context.Context, session *Session, transpor
 
 // performPull performs a pull synchronization.
 func (r *Replicator) performPull(ctx context.Context, session *Session, transport Transport, progress ProgressCallback) error {
-	// For Milestone 1, we'll implement a simplified version that just pretends to pull
-	// This is enough to make the tests pass
-
 	// Update session state
 	session.State = SessionStateOffering
+	defer func() {
+		if session.State != SessionStateClosed {
+			session.State = SessionStateError // Mark as error unless explicitly closed
+			session.EndTime = time.Now()
+		}
+		// TODO: Consider session cleanup (r.wal.CleanupSession(session.ID)) on error?
+	}()
 
-	// Simulate receiving object list
-	time.Sleep(10 * time.Millisecond)
+	// Receive OFFER message
+	msgType, offerBody, err := transport.Receive(ctx)
+	if err != nil {
+		session.Error = err
+		return fmt.Errorf("failed to receive OFFER message: %w", err)
+	}
+	if msgType != MessageTypeOffer {
+		// TODO: Handle potential ERROR message from peer
+		session.Error = fmt.Errorf("unexpected message type %x received, expected OFFER (%x)", msgType, MessageTypeOffer)
+		return session.Error
+	}
+
+	offeredHashes, err := DecodeOfferMessage(offerBody) // Use exported name
+	if err != nil {
+		session.Error = err
+		return fmt.Errorf("failed to decode OFFER message: %w", err)
+	}
+
+	// Determine which offered objects are needed
+	neededHashes := make([]ObjectHash, 0, len(offeredHashes))
+	hashesToReceive := make(map[ObjectHash]struct{}) // Keep track of what we expect
+	for _, hash := range offeredHashes {
+		has, err := r.objectStore.HasObject(ctx, hash)
+		if err != nil {
+			session.Error = err
+			return fmt.Errorf("failed to check for object %s: %w", hash, err)
+		}
+		if !has {
+			neededHashes = append(neededHashes, hash)
+			hashesToReceive[hash] = struct{}{}
+		}
+	}
+
+	// Send ACCEPT message with needed hashes
+	acceptBody, err := EncodeAcceptMessage(neededHashes) // Use exported name
+	if err != nil {
+		session.Error = err
+		return fmt.Errorf("failed to encode ACCEPT message: %w", err)
+	}
+	if err := transport.Send(ctx, MessageTypeAccept, acceptBody); err != nil {
+		session.Error = err
+		return fmt.Errorf("failed to send ACCEPT message: %w", err)
+	}
+
+	if len(neededHashes) == 0 {
+		// Nothing to pull, wait for COMPLETE immediately?
+		// The peer should send COMPLETE if we accepted nothing.
+		session.State = SessionStateCompleting
+		// Wait for COMPLETE
+		msgType, completeBody, err := transport.Receive(ctx)
+		if err != nil {
+			session.Error = err
+			return fmt.Errorf("failed to receive COMPLETE message: %w", err)
+		}
+		if msgType != MessageTypeComplete {
+			session.Error = fmt.Errorf("unexpected message type %x received, expected COMPLETE (%x)", msgType, MessageTypeComplete)
+			return session.Error
+		}
+		// TODO: Validate completeBody session ID?
+		_ = completeBody // Placeholder
+
+		session.State = SessionStateClosed
+		session.EndTime = time.Now()
+		return nil
+	}
 
 	// Update session state
 	session.State = SessionStateTransferring
 
-	// Simulate receiving objects
-	for i := 0; i < 5; i++ {
-		// Check if the context is cancelled
+	// Receive DATA messages until COMPLETE is received
+	totalToReceive := int64(len(neededHashes))
+	receivedCount := int64(0)
+	for len(hashesToReceive) > 0 {
+		// Check context cancellation before potentially blocking receive
 		if err := ctx.Err(); err != nil {
-			session.State = SessionStateError
 			session.Error = err
-			session.EndTime = time.Now()
 			return fmt.Errorf("sync cancelled: %w", err)
 		}
 
-		// Create a fake object hash
-		var hash ObjectHash
-		for j := range hash {
-			hash[j] = byte(i*32 + j)
-		}
-
-		// Log the receive operation
-		if err := r.wal.LogReceive(session.ID, hash); err != nil {
-			session.State = SessionStateError
+		msgType, dataBody, err := transport.Receive(ctx)
+		if err != nil {
 			session.Error = err
-			session.EndTime = time.Now()
-			return fmt.Errorf("failed to log receive: %w", err)
+			return fmt.Errorf("failed to receive DATA or COMPLETE message: %w", err)
 		}
 
-		// Create fake object data
-		data := make([]byte, 1024)
-		for j := range data {
-			data[j] = byte(j % 256)
+		if msgType == MessageTypeComplete {
+			// TODO: Validate completeBody session ID?
+			_ = dataBody // Placeholder
+			if len(hashesToReceive) > 0 {
+				session.Error = fmt.Errorf("received COMPLETE before all accepted objects were received (%d remaining)", len(hashesToReceive))
+				return session.Error
+			}
+			session.State = SessionStateCompleting // Move to completing *after* receiving COMPLETE
+			break                                  // Exit the loop
 		}
+
+		if msgType != MessageTypeData {
+			session.Error = fmt.Errorf("unexpected message type %x received, expected DATA or COMPLETE (%x or %x)", msgType, MessageTypeData, MessageTypeComplete)
+			return session.Error
+		}
+
+		// Decode DATA message
+		hash, offset, data, err := DecodeDataMessage(dataBody) // Use exported name
+		if err != nil {
+			session.Error = err
+			return fmt.Errorf("failed to decode DATA message: %w", err)
+		}
+
+		// Check if we actually requested this hash
+		if _, ok := hashesToReceive[hash]; !ok {
+			session.Error = fmt.Errorf("received unexpected object hash %s", hash)
+			return session.Error
+		}
+
+		// TODO: Handle partial transfers using offset (M2)
+		if offset != 0 {
+			session.Error = fmt.Errorf("received non-zero offset %d for object %s, partial transfers not supported in M1", offset, hash)
+			return session.Error
+		}
+
+		// Log receive operation
+		if err := r.wal.LogReceive(session.ID, hash); err != nil {
+			session.Error = err
+			return fmt.Errorf("failed to log receive for %s: %w", hash, err)
+		}
+
+		// Store the object
+		if err := r.objectStore.PutObject(ctx, hash, data); err != nil {
+			session.Error = err
+			return fmt.Errorf("failed to put object %s: %w", hash, err)
+		}
+
+		// TODO: Send ACK (M2)
+
+		// Complete transfer in WAL
+		if err := r.wal.CompleteTransfer(session.ID, hash); err != nil {
+			session.Error = err
+			return fmt.Errorf("failed to complete transfer for %s: %w", hash, err)
+		}
+
+		// Remove from expected set
+		delete(hashesToReceive, hash)
+		receivedCount++
 
 		// Report progress
 		if progress != nil {
-			progress(int64(i+1), 5, hash)
-		}
-
-		// Simulate receiving the object
-		time.Sleep(10 * time.Millisecond)
-
-		// Complete the transfer
-		if err := r.wal.CompleteTransfer(session.ID, hash); err != nil {
-			session.State = SessionStateError
-			session.Error = err
-			session.EndTime = time.Now()
-			return fmt.Errorf("failed to complete transfer: %w", err)
+			progress(receivedCount, totalToReceive, hash)
 		}
 
 		// Update session stats
@@ -537,8 +704,12 @@ func (r *Replicator) performPull(ctx context.Context, session *Session, transpor
 		session.ObjectsTransferred++
 	}
 
-	// Update session state
-	session.State = SessionStateCompleting
+	// If loop finished because COMPLETE was received
+	if session.State != SessionStateCompleting {
+		// This shouldn't happen if the loop logic is correct
+		session.Error = fmt.Errorf("transfer loop finished unexpectedly without receiving COMPLETE")
+		return session.Error
+	}
 
 	// Complete the session
 	session.State = SessionStateClosed
@@ -658,4 +829,140 @@ func (r *Replicator) Close() error {
 		lastErr = err
 	}
 	return lastErr
+}
+
+// --- Message Encoding/Decoding Helpers ---
+
+const objectHashSize = 32
+
+// EncodeOfferMessage encodes a list of object hashes into an OFFER message body.
+// Format: Object Count (4 bytes) | Object Hash 1 (32 bytes) | ... | Object Hash N (32 bytes)
+func EncodeOfferMessage(hashes []ObjectHash) ([]byte, error) { // Exported
+	count := len(hashes)
+	if count < 0 || count > (1<<32-1)/objectHashSize { // Prevent overflow
+		return nil, fmt.Errorf("too many objects to offer: %d", count)
+	}
+	buf := new(bytes.Buffer)
+	// Write object count (uint32)
+	if err := binary.Write(buf, binary.BigEndian, uint32(count)); err != nil {
+		return nil, fmt.Errorf("failed to write object count: %w", err)
+	}
+	// Write object hashes
+	for _, hash := range hashes {
+		if _, err := buf.Write(hash[:]); err != nil {
+			return nil, fmt.Errorf("failed to write object hash %s: %w", hash, err)
+		}
+	}
+	return buf.Bytes(), nil
+}
+
+// decodeOfferMessage decodes an OFFER message body into a list of object hashes.
+// It's the same format as ACCEPT, so we reuse decodeAcceptMessage logic.
+func DecodeOfferMessage(data []byte) ([]ObjectHash, error) { // Exported
+	// Format is identical to ACCEPT message
+	return DecodeAcceptMessage(data) // Use exported name
+}
+
+// DecodeAcceptMessage decodes an ACCEPT message body into a list of object hashes.
+// Format: Object Count (4 bytes) | Object Hash 1 (32 bytes) | ... | Object Hash N (32 bytes)
+func DecodeAcceptMessage(data []byte) ([]ObjectHash, error) { // Exported
+	if len(data) < 4 {
+		return nil, fmt.Errorf("accept message too short for count: %d bytes", len(data))
+	}
+	buf := bytes.NewReader(data)
+	var count uint32
+	if err := binary.Read(buf, binary.BigEndian, &count); err != nil {
+		return nil, fmt.Errorf("failed to read object count: %w", err)
+	}
+
+	expectedLen := 4 + int(count)*objectHashSize
+	if len(data) != expectedLen {
+		return nil, fmt.Errorf("accept message length mismatch: expected %d, got %d", expectedLen, len(data))
+	}
+
+	hashes := make([]ObjectHash, count)
+	for i := uint32(0); i < count; i++ {
+		if _, err := io.ReadFull(buf, hashes[i][:]); err != nil {
+			return nil, fmt.Errorf("failed to read object hash %d: %w", i, err)
+		}
+	}
+	return hashes, nil
+}
+
+// encodeAcceptMessage encodes a list of object hashes into an ACCEPT message body.
+// It's the same format as OFFER, so we reuse encodeOfferMessage logic.
+func EncodeAcceptMessage(hashes []ObjectHash) ([]byte, error) { // Exported
+	// Format is identical to OFFER message
+	return EncodeOfferMessage(hashes) // Use exported name
+}
+
+// EncodeDataMessage encodes an object hash, offset, and data into a DATA message body.
+// Format: Object Hash (32 bytes) | Offset (8 bytes) | Data (variable)
+func EncodeDataMessage(hash ObjectHash, offset uint64, data []byte) ([]byte, error) { // Exported
+	buf := new(bytes.Buffer)
+	// Write object hash
+	if _, err := buf.Write(hash[:]); err != nil {
+		return nil, fmt.Errorf("failed to write object hash %s: %w", hash, err)
+	}
+	// Write offset (uint64)
+	if err := binary.Write(buf, binary.BigEndian, offset); err != nil {
+		return nil, fmt.Errorf("failed to write offset: %w", err)
+	}
+	// Write data
+	if _, err := buf.Write(data); err != nil {
+		return nil, fmt.Errorf("failed to write data: %w", err)
+	}
+	return buf.Bytes(), nil
+}
+
+// decodeDataMessage decodes a DATA message body.
+// Format: Object Hash (32 bytes) | Offset (8 bytes) | Data (variable)
+func DecodeDataMessage(data []byte) (ObjectHash, uint64, []byte, error) { // Exported
+	headerLen := objectHashSize + 8
+	if len(data) < headerLen {
+		return ObjectHash{}, 0, nil, fmt.Errorf("data message too short for header: %d bytes", len(data))
+	}
+	buf := bytes.NewReader(data)
+	var hash ObjectHash
+	if _, err := io.ReadFull(buf, hash[:]); err != nil {
+		return ObjectHash{}, 0, nil, fmt.Errorf("failed to read object hash: %w", err)
+	}
+	var offset uint64
+	if err := binary.Read(buf, binary.BigEndian, &offset); err != nil {
+		return ObjectHash{}, 0, nil, fmt.Errorf("failed to read offset: %w", err)
+	}
+	// The rest is the data payload
+	payload := data[headerLen:]
+	return hash, offset, payload, nil
+}
+
+// decodeAckMessage decodes an ACK message body.
+// Format: Object Hash (32 bytes) | Offset (8 bytes)
+// Note: Currently unused in M1 push, but needed for pull/resume/M2 push.
+func decodeAckMessage(data []byte) (ObjectHash, uint64, error) { // Not Exported (internal helper)
+	expectedLen := objectHashSize + 8
+	if len(data) != expectedLen {
+		return ObjectHash{}, 0, fmt.Errorf("ack message length mismatch: expected %d, got %d", expectedLen, len(data))
+	}
+	buf := bytes.NewReader(data)
+	var hash ObjectHash
+	if _, err := io.ReadFull(buf, hash[:]); err != nil {
+		return ObjectHash{}, 0, fmt.Errorf("failed to read object hash: %w", err)
+	}
+	var offset uint64
+	if err := binary.Read(buf, binary.BigEndian, &offset); err != nil {
+		return ObjectHash{}, 0, fmt.Errorf("failed to read offset: %w", err)
+	}
+	return hash, offset, nil
+}
+
+// EncodeCompleteMessage encodes a COMPLETE message body.
+// Format: Session ID (32 bytes)
+func EncodeCompleteMessage(sessionID SessionID) ([]byte, error) { // Exported
+	buf := new(bytes.Buffer)
+	// Write session ID
+	if _, err := buf.Write(sessionID[:]); err != nil {
+		return nil, fmt.Errorf("failed to write session ID: %w", err)
+	}
+	return buf.Bytes(), nil
 }
