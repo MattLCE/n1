@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"time"
 )
 
@@ -61,8 +62,10 @@ func (f *TransportFactory) CreateTransport(ctx context.Context, peer string) (Tr
 // QUICTransport is a placeholder for the QUIC transport implementation.
 // This is currently disabled due to missing dependencies.
 type QUICTransport struct {
-	peer   string
-	config TransportConfig
+	// These fields are currently unused since QUIC is not implemented
+	// but are kept for future implementation
+	_ string          // peer
+	_ TransportConfig // config
 }
 
 // NewQUICTransport creates a new QUIC transport.
@@ -117,7 +120,34 @@ func NewTCPTransport(peer string, config TransportConfig) (*TCPTransport, error)
 
 // Connect establishes a TCP connection to the peer.
 func (t *TCPTransport) Connect(ctx context.Context) error {
-	// Parse the peer address
+	// Special handling for toxiproxy addresses
+	if strings.HasPrefix(t.peer, "toxiproxy:") {
+		// Format is toxiproxy:host:port
+		parts := strings.SplitN(t.peer, ":", 3)
+		if len(parts) != 3 {
+			return fmt.Errorf("invalid toxiproxy address format: %s", t.peer)
+		}
+
+		// Use the host and port directly
+		host := parts[1]
+		port := parts[2]
+
+		// Create a dialer with the context
+		dialer := &net.Dialer{
+			Timeout: t.config.ConnectTimeout,
+		}
+
+		// Connect to the peer
+		conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(host, port))
+		if err != nil {
+			return fmt.Errorf("failed to dial TCP: %w", err)
+		}
+
+		t.conn = conn
+		return nil
+	}
+
+	// Regular address handling
 	host, port, err := net.SplitHostPort(t.peer)
 	if err != nil {
 		// If no port is specified, use the default TCP port
@@ -139,8 +169,12 @@ func (t *TCPTransport) Connect(ctx context.Context) error {
 	// Set keep-alive
 	tcpConn, ok := conn.(*net.TCPConn)
 	if ok {
-		tcpConn.SetKeepAlive(true)
-		tcpConn.SetKeepAlivePeriod(t.config.KeepAliveInterval)
+		if err := tcpConn.SetKeepAlive(true); err != nil {
+			return fmt.Errorf("failed to set keep alive: %w", err)
+		}
+		if err := tcpConn.SetKeepAlivePeriod(t.config.KeepAliveInterval); err != nil {
+			return fmt.Errorf("failed to set keep alive period: %w", err)
+		}
 	}
 
 	t.conn = conn
@@ -172,14 +206,26 @@ func (t *TCPTransport) Send(ctx context.Context, msgType byte, data []byte) erro
 
 	// Set a deadline if the context has one
 	if deadline, ok := ctx.Deadline(); ok {
-		t.conn.SetWriteDeadline(deadline)
-		defer t.conn.SetWriteDeadline(time.Time{}) // Clear deadline after write
+		if err := t.conn.SetWriteDeadline(deadline); err != nil {
+			return fmt.Errorf("failed to set write deadline: %w", err)
+		}
+		defer func() {
+			if err := t.conn.SetWriteDeadline(time.Time{}); err != nil {
+				// Just log this error since we're in a defer
+				fmt.Printf("failed to clear write deadline: %v\n", err)
+			}
+		}()
 	}
 
 	// Create a header with the message type and length
 	header := make([]byte, 5)
 	header[0] = msgType
-	binary.BigEndian.PutUint32(header[1:], uint32(len(data)))
+	// Safely convert len(data) to uint32 to avoid overflow
+	dataLen := len(data)
+	if dataLen < 0 || dataLen > (1<<32-1) {
+		return fmt.Errorf("data length %d out of range for uint32", dataLen)
+	}
+	binary.BigEndian.PutUint32(header[1:], uint32(dataLen))
 
 	// Write the header
 	_, err := t.conn.Write(header)
@@ -204,8 +250,15 @@ func (t *TCPTransport) Receive(ctx context.Context) (byte, []byte, error) {
 
 	// Set a deadline if the context has one
 	if deadline, ok := ctx.Deadline(); ok {
-		t.conn.SetReadDeadline(deadline)
-		defer t.conn.SetReadDeadline(time.Time{}) // Clear deadline after read
+		if err := t.conn.SetReadDeadline(deadline); err != nil {
+			return 0, nil, fmt.Errorf("failed to set read deadline: %w", err)
+		}
+		defer func() {
+			if err := t.conn.SetReadDeadline(time.Time{}); err != nil {
+				// Just log this error since we're in a defer
+				fmt.Printf("failed to clear read deadline: %v\n", err)
+			}
+		}()
 	}
 
 	// Read the header

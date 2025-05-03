@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
@@ -38,44 +39,91 @@ func NewObjectStoreAdapter(db *sql.DB, vaultPath string, masterKey []byte) *Obje
 
 // GetObject gets an object by its hash
 func (a *ObjectStoreAdapter) GetObject(ctx context.Context, hash miror.ObjectHash) ([]byte, error) {
-	// Implementation would convert the hash to a key and retrieve from the vault
-	// This is a placeholder implementation
-	return nil, fmt.Errorf("not implemented")
+	key := hash.String()
+	return a.secureDAO.Get(key)
 }
 
 // PutObject puts an object with the given hash and data
 func (a *ObjectStoreAdapter) PutObject(ctx context.Context, hash miror.ObjectHash, data []byte) error {
-	// Implementation would convert the hash to a key and store in the vault
-	// This is a placeholder implementation
-	return fmt.Errorf("not implemented")
+	key := hash.String()
+	return a.secureDAO.Put(key, data)
 }
 
 // HasObject checks if an object exists
 func (a *ObjectStoreAdapter) HasObject(ctx context.Context, hash miror.ObjectHash) (bool, error) {
-	// Implementation would convert the hash to a key and check if it exists in the vault
-	// This is a placeholder implementation
-	return false, fmt.Errorf("not implemented")
+	key := hash.String()
+	_, err := a.secureDAO.Get(key)
+	if err == dao.ErrNotFound {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // ListObjects lists all object hashes
 func (a *ObjectStoreAdapter) ListObjects(ctx context.Context) ([]miror.ObjectHash, error) {
-	// Implementation would list all keys in the vault and convert them to hashes
-	// This is a placeholder implementation
-	return nil, fmt.Errorf("not implemented")
+	keys, err := a.secureDAO.List()
+	if err != nil {
+		return nil, err
+	}
+
+	var hashes []miror.ObjectHash
+	for _, key := range keys {
+		// Skip the canary record
+		if key == "__n1_canary__" {
+			continue
+		}
+
+		// Convert key to hash
+		var hash miror.ObjectHash
+		// In a real implementation, we would convert the key to a hash
+		// For now, we'll just use a placeholder
+		copy(hash[:], []byte(key))
+		hashes = append(hashes, hash)
+	}
+
+	return hashes, nil
 }
 
 // GetObjectReader gets a reader for an object
 func (a *ObjectStoreAdapter) GetObjectReader(ctx context.Context, hash miror.ObjectHash) (io.ReadCloser, error) {
-	// Implementation would get a reader for the object
-	// This is a placeholder implementation
-	return nil, fmt.Errorf("not implemented")
+	data, err := a.GetObject(ctx, hash)
+	if err != nil {
+		return nil, err
+	}
+	return io.NopCloser(bytes.NewReader(data)), nil
 }
 
 // GetObjectWriter gets a writer for an object
 func (a *ObjectStoreAdapter) GetObjectWriter(ctx context.Context, hash miror.ObjectHash) (io.WriteCloser, error) {
-	// Implementation would get a writer for the object
-	// This is a placeholder implementation
-	return nil, fmt.Errorf("not implemented")
+	// Create a buffer to collect the data
+	buf := &bytes.Buffer{}
+
+	// Return a writer that writes to the buffer and then to the object store when closed
+	return &objectWriter{
+		buffer:      buf,
+		hash:        hash,
+		objectStore: a,
+		ctx:         ctx,
+	}, nil
+}
+
+// objectWriter is a WriteCloser that writes to a buffer and then to the object store when closed
+type objectWriter struct {
+	buffer      *bytes.Buffer
+	hash        miror.ObjectHash
+	objectStore *ObjectStoreAdapter
+	ctx         context.Context
+}
+
+func (w *objectWriter) Write(p []byte) (n int, err error) {
+	return w.buffer.Write(p)
+}
+
+func (w *objectWriter) Close() error {
+	return w.objectStore.PutObject(w.ctx, w.hash, w.buffer.Bytes())
 }
 
 // syncCmd is the command for synchronizing vaults

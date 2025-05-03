@@ -13,8 +13,16 @@ RUN go mod download
 # Copy the source code
 COPY . .
 
-# Build the test runner (needs build-base for CGO)
+# Build the test runner and bosr executable (needs build-base for CGO)
 RUN CGO_ENABLED=1 GOOS=linux go test -c -o /app/bin/sync.test ./test/sync
+RUN CGO_ENABLED=1 GOOS=linux go build -o /app/bin/bosr ./cmd/bosr
+RUN CGO_ENABLED=1 GOOS=linux go build -o /app/bin/mirord ./cmd/mirord
+
+# Add binaries to PATH
+RUN mkdir -p /usr/local/bin && \
+    cp /app/bin/bosr /usr/local/bin/bosr && \
+    cp /app/bin/mirord /usr/local/bin/mirord && \
+    chmod +x /usr/local/bin/bosr /usr/local/bin/mirord
 
 # Create test directory (optional,WORKDIR /test might not be strictly needed depending on test execution)
 WORKDIR /test

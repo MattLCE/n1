@@ -89,7 +89,7 @@ func writePIDFile(path string) error {
 
 	// Write the PID
 	pid := os.Getpid()
-	if err := os.WriteFile(path, []byte(fmt.Sprintf("%d", pid)), 0644); err != nil {
+	if err := os.WriteFile(path, []byte(fmt.Sprintf("%d", pid)), 0600); err != nil {
 		return fmt.Errorf("failed to write PID file: %w", err)
 	}
 
@@ -117,7 +117,11 @@ func runDaemon(config Config) error {
 	if err := writePIDFile(config.PIDFile); err != nil {
 		return err
 	}
-	defer removePIDFile(config.PIDFile)
+	defer func() {
+		if err := removePIDFile(config.PIDFile); err != nil {
+			log.Error().Err(err).Str("path", config.PIDFile).Msg("Failed to remove PID file")
+		}
+	}()
 
 	// Set up signal handling
 	ctx, cancel := context.WithCancel(context.Background())
