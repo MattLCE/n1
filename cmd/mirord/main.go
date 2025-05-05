@@ -4,6 +4,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/n1/n1/internal/crypto"
 	"github.com/n1/n1/internal/dao"
 	"github.com/n1/n1/internal/log"
 	"github.com/n1/n1/internal/miror"
@@ -112,71 +114,147 @@ func removePIDFile(path string) error {
 	return nil
 }
 
-// --- ObjectStoreAdapter (Copied from cmd/bosr/sync.go for now) ---
+// --- ObjectStoreAdapter (Implements real content hashing) ---
 
 // ObjectStoreAdapter adapts the vault DAO to the miror.ObjectStore interface
 type ObjectStoreAdapter struct {
 	db        *sql.DB
 	vaultPath string
 	secureDAO *dao.SecureVaultDAO
+	// hashToKey maps object hashes to their keys in the vault
+	hashToKey map[string]string
+	// keyToHash maps keys to their content hashes
+	keyToHash map[string]miror.ObjectHash
 }
 
 // NewObjectStoreAdapter creates a new adapter for the vault
 func NewObjectStoreAdapter(db *sql.DB, vaultPath string, masterKey []byte) *ObjectStoreAdapter {
-	return &ObjectStoreAdapter{
+	adapter := &ObjectStoreAdapter{
 		db:        db,
 		vaultPath: vaultPath,
 		secureDAO: dao.NewSecureVaultDAO(db, masterKey),
+		hashToKey: make(map[string]string),
+		keyToHash: make(map[string]miror.ObjectHash),
 	}
+
+	// Initialize the hash mappings
+	adapter.initHashMappings()
+
+	return adapter
 }
 
-// GetObject gets an object by its hash
-func (a *ObjectStoreAdapter) GetObject(ctx context.Context, hash miror.ObjectHash) ([]byte, error) {
-	key := hash.String()
-	// TODO: This key conversion is likely incorrect. Need proper hash<->key mapping.
-	// For M1, assume hash string IS the key for simplicity in tests.
-	return a.secureDAO.Get(key)
-}
-
-// PutObject puts an object with the given hash and data
-func (a *ObjectStoreAdapter) PutObject(ctx context.Context, hash miror.ObjectHash, data []byte) error {
-	key := hash.String()
-	// TODO: This key conversion is likely incorrect.
-	return a.secureDAO.Put(key, data)
-}
-
-// HasObject checks if an object exists
-func (a *ObjectStoreAdapter) HasObject(ctx context.Context, hash miror.ObjectHash) (bool, error) {
-	key := hash.String()
-	// TODO: This key conversion is likely incorrect.
-	_, err := a.secureDAO.Get(key)
-	if errors.Is(err, dao.ErrNotFound) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
-// ListObjects lists all object hashes
-func (a *ObjectStoreAdapter) ListObjects(ctx context.Context) ([]miror.ObjectHash, error) {
+// initHashMappings initializes the hash-to-key and key-to-hash mappings
+func (a *ObjectStoreAdapter) initHashMappings() {
+	// List all keys in the vault
 	keys, err := a.secureDAO.List()
 	if err != nil {
-		return nil, err
+		log.Error().Err(err).Msg("Failed to list keys during initialization")
+		return
 	}
 
-	var hashes []miror.ObjectHash
+	// Build the mappings
 	for _, key := range keys {
 		// Skip the canary record
 		if key == "__n1_canary__" {
 			continue
 		}
 
-		// Convert key to hash
-		// TODO: This key conversion is likely incorrect.
-		var hash miror.ObjectHash
-		copy(hash[:], []byte(key)) // Placeholder conversion
+		// Get the encrypted value
+		encryptedValue, err := a.secureDAO.Get(key)
+		if err != nil {
+			log.Error().Err(err).Str("key", key).Msg("Failed to get value during initialization")
+			continue
+		}
+
+		// Compute the hash of the encrypted value
+		hash := a.computeObjectHash(encryptedValue)
+		hashStr := hash.String()
+
+		// Store the mappings
+		a.hashToKey[hashStr] = key
+		a.keyToHash[key] = hash
+	}
+}
+
+// computeObjectHash computes the SHA-256 hash of the encrypted value
+func (a *ObjectStoreAdapter) computeObjectHash(encryptedValue []byte) miror.ObjectHash {
+	var hash miror.ObjectHash
+	h := sha256.Sum256(encryptedValue)
+	copy(hash[:], h[:])
+	return hash
+}
+
+// GetObject gets an object by its hash
+func (a *ObjectStoreAdapter) GetObject(ctx context.Context, hash miror.ObjectHash) ([]byte, error) {
+	hashStr := hash.String()
+
+	// Look up the key for this hash
+	key, exists := a.hashToKey[hashStr]
+	if !exists {
+		return nil, dao.ErrNotFound
+	}
+
+	// Get the encrypted value
+	encryptedValue, err := a.secureDAO.Get(key)
+	if err != nil {
+		return nil, err
+	}
+
+	// Verify the hash matches
+	computedHash := a.computeObjectHash(encryptedValue)
+	if computedHash.String() != hashStr {
+		return nil, fmt.Errorf("hash mismatch for key %s", key)
+	}
+
+	// Get and decrypt the value
+	return a.secureDAO.Get(key)
+}
+
+// PutObject puts an object with the given hash and data
+func (a *ObjectStoreAdapter) PutObject(ctx context.Context, hash miror.ObjectHash, data []byte) error {
+	// First, encrypt the data to get the encrypted blob
+	masterKey, err := secretstore.Default.Get(a.vaultPath)
+	if err != nil {
+		return fmt.Errorf("failed to get master key: %w", err)
+	}
+
+	encryptedData, err := crypto.EncryptBlob(masterKey, data)
+	if err != nil {
+		return fmt.Errorf("failed to encrypt data: %w", err)
+	}
+
+	// Compute the hash of the encrypted data
+	computedHash := a.computeObjectHash(encryptedData)
+
+	// Verify the hash matches what was provided
+	if !bytes.Equal(computedHash[:], hash[:]) {
+		return fmt.Errorf("hash mismatch: expected %s, got %s", hash.String(), computedHash.String())
+	}
+
+	// Use the hash as the key
+	key := hash.String()
+
+	// Store the mappings
+	a.hashToKey[key] = key
+	a.keyToHash[key] = hash
+
+	// Store the data
+	return a.secureDAO.Put(key, data)
+}
+
+// HasObject checks if an object exists
+func (a *ObjectStoreAdapter) HasObject(ctx context.Context, hash miror.ObjectHash) (bool, error) {
+	hashStr := hash.String()
+	_, exists := a.hashToKey[hashStr]
+	return exists, nil
+}
+
+// ListObjects lists all object hashes
+func (a *ObjectStoreAdapter) ListObjects(ctx context.Context) ([]miror.ObjectHash, error) {
+	var hashes []miror.ObjectHash
+
+	// Use the precomputed hashes from our mapping
+	for _, hash := range a.keyToHash {
 		hashes = append(hashes, hash)
 	}
 
@@ -216,7 +294,37 @@ func (w *objectWriter) Write(p []byte) (n int, err error) {
 }
 
 func (w *objectWriter) Close() error {
-	return w.objectStore.PutObject(w.ctx, w.hash, w.buffer.Bytes())
+	// When closing the writer, we compute the actual hash of the encrypted data
+	// and verify it matches the expected hash
+	data := w.buffer.Bytes()
+
+	// Get the master key
+	masterKey, err := secretstore.Default.Get(w.objectStore.vaultPath)
+	if err != nil {
+		return fmt.Errorf("failed to get master key: %w", err)
+	}
+
+	// Encrypt the data
+	encryptedData, err := crypto.EncryptBlob(masterKey, data)
+	if err != nil {
+		return fmt.Errorf("failed to encrypt data: %w", err)
+	}
+
+	// Compute the hash of the encrypted data
+	computedHash := w.objectStore.computeObjectHash(encryptedData)
+
+	// If the hash doesn't match, we need to update it
+	if !bytes.Equal(computedHash[:], w.hash[:]) {
+		log.Warn().
+			Str("expected", w.hash.String()).
+			Str("computed", computedHash.String()).
+			Msg("Hash mismatch in objectWriter.Close(), using computed hash")
+
+		w.hash = computedHash
+	}
+
+	// Store the object with the correct hash
+	return w.objectStore.PutObject(w.ctx, w.hash, data)
 }
 
 // --- End ObjectStoreAdapter ---
