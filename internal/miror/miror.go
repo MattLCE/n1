@@ -762,82 +762,119 @@ func (r *Replicator) performPull(ctx context.Context, session *Session, transpor
 
 // performFollow performs a bidirectional continuous synchronization.
 func (r *Replicator) performFollow(ctx context.Context, session *Session, transport Transport, progress ProgressCallback) error {
-	// For Milestone 1, we'll implement a simplified version that just pretends to follow
-	// This is enough to make the tests pass
-
 	// Update session state
-	session.State = SessionStateOffering
+	session.State = SessionStateReady
+	defer func() {
+		if session.State != SessionStateClosed {
+			session.State = SessionStateError // Mark as error unless explicitly closed
+			session.EndTime = time.Now()
+		}
+	}()
 
-	// Simulate exchanging object lists
-	time.Sleep(10 * time.Millisecond)
+	// Define constants for follow mode
+	const (
+		// Sync interval to maintain systems within 5 seconds of convergence
+		syncInterval = 5 * time.Second
 
-	// Update session state
-	session.State = SessionStateTransferring
+		// Maximum time to wait for a response before considering it a timeout
+		responseTimeout = 10 * time.Second
+	)
 
-	// Simulate continuous sync until context is cancelled
-	for i := 0; ; i++ {
+	// Create a ticker for regular sync operations
+	ticker := time.NewTicker(syncInterval)
+	defer ticker.Stop()
+
+	// Track the last successful sync time
+	lastSyncTime := time.Now()
+
+	// Create a session ID for this follow session
+	var followSessionID SessionID
+	copy(followSessionID[:], session.ID[:])
+
+	// Main follow loop - continues until context is cancelled
+	for {
 		// Check if the context is cancelled
 		if err := ctx.Err(); err != nil {
-			// This is expected for follow mode
+			// This is expected for follow mode - clean exit
 			session.State = SessionStateClosed
 			session.EndTime = time.Now()
 			return nil
 		}
 
-		// Create a fake object hash
-		var hash ObjectHash
-		for j := range hash {
-			hash[j] = byte(i*32 + j)
+		// Create a context with timeout for this sync cycle
+		syncCtx, cancel := context.WithTimeout(ctx, responseTimeout)
+
+		// Create a pull session that shares the same ID
+		pullSession := &Session{
+			ID:        followSessionID,
+			PeerID:    session.PeerID,
+			State:     SessionStateReady,
+			StartTime: time.Now(),
 		}
 
-		// Log the receive operation
-		if err := r.wal.LogReceive(session.ID, hash); err != nil {
-			session.State = SessionStateError
-			session.Error = err
+		// Perform a pull operation to get any new objects from the peer
+		pullErr := r.performPull(syncCtx, pullSession, transport, progress)
+
+		// Update the main session stats with pull results
+		session.BytesTransferred += pullSession.BytesTransferred
+		session.ObjectsTransferred += pullSession.ObjectsTransferred
+
+		if pullErr != nil && !errors.Is(pullErr, context.Canceled) && !errors.Is(pullErr, context.DeadlineExceeded) {
+			// Log the error but continue - we want to be resilient to temporary failures
+			session.Error = fmt.Errorf("follow mode pull error: %w", pullErr)
+			// We don't return here to allow for recovery in the next cycle
+		} else {
+			// Reset error state if pull was successful
+			session.Error = nil
+		}
+
+		// Create a push session that shares the same ID
+		pushSession := &Session{
+			ID:        followSessionID,
+			PeerID:    session.PeerID,
+			State:     SessionStateReady,
+			StartTime: time.Now(),
+		}
+
+		// Perform a push operation to send any new objects to the peer
+		pushErr := r.performPush(syncCtx, pushSession, transport, progress)
+
+		// Update the main session stats with push results
+		session.BytesTransferred += pushSession.BytesTransferred
+		session.ObjectsTransferred += pushSession.ObjectsTransferred
+
+		if pushErr != nil && !errors.Is(pushErr, context.Canceled) && !errors.Is(pushErr, context.DeadlineExceeded) {
+			// Log the error but continue - we want to be resilient to temporary failures
+			session.Error = fmt.Errorf("follow mode push error: %w", pushErr)
+			// We don't return here to allow for recovery in the next cycle
+		} else if session.Error == nil {
+			// Update last successful sync time only if both operations were successful
+			lastSyncTime = time.Now()
+		}
+
+		// Clean up the timeout context
+		cancel()
+
+		// Check if we've been unable to sync for too long (24 hours)
+		// This would indicate a persistent failure that needs attention
+		if time.Since(lastSyncTime) > 24*time.Hour {
+			session.Error = fmt.Errorf("follow mode failed to sync for over 24 hours")
 			session.EndTime = time.Now()
-			return fmt.Errorf("failed to log receive: %w", err)
+			return session.Error
 		}
 
-		// Create fake object data
-		data := make([]byte, 1024)
-		for j := range data {
-			data[j] = byte(j % 256)
-		}
-
-		// Report progress
-		if progress != nil {
-			progress(int64(i+1), int64(i+2), hash)
-		}
-
-		// Simulate receiving the object
-		time.Sleep(100 * time.Millisecond)
-
-		// Complete the transfer
-		if err := r.wal.CompleteTransfer(session.ID, hash); err != nil {
-			session.State = SessionStateError
-			session.Error = err
+		// Wait for the next sync interval or context cancellation
+		select {
+		case <-ticker.C:
+			// Time for next sync cycle
+			continue
+		case <-ctx.Done():
+			// Context was cancelled, exit cleanly
+			session.State = SessionStateClosed
 			session.EndTime = time.Now()
-			return fmt.Errorf("failed to complete transfer: %w", err)
-		}
-
-		// Update session stats
-		session.BytesTransferred += int64(len(data))
-		session.ObjectsTransferred++
-
-		// Limit the number of iterations for testing
-		if i >= 10 {
-			break
+			return nil
 		}
 	}
-
-	// Update session state
-	session.State = SessionStateCompleting
-
-	// Complete the session
-	session.State = SessionStateClosed
-	session.EndTime = time.Now()
-
-	return nil
 }
 
 // GetSession gets information about a session.

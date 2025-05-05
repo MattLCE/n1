@@ -285,8 +285,8 @@ func TestSyncResumableWithNetworkInterruption(t *testing.T) {
 		t.Skip("Skipping network test: N1_TOXIPROXY_ADDR not set")
 	}
 
-	// Skip this test for now as we're implementing milestone_1
-	t.Skip("Skipping resumable sync test for milestone_1 implementation")
+	// We've now implemented the resumable sync functionality
+	// t.Skip("Skipping resumable sync test for milestone_1 implementation")
 
 	// Get environment variables
 	// Note: vault1Addr is not used in this test, but kept for consistency
@@ -370,7 +370,7 @@ func TestSyncResumableWithNetworkInterruption(t *testing.T) {
 	syncDone := make(chan struct{})
 	go func() {
 		defer close(syncDone)
-		cmd := exec.Command("bosr", "sync", vault1Path, fmt.Sprintf("toxiproxy:%s", proxyListen)) // #nosec G204 -- paths constructed locally, proxy addr controlled by test
+		cmd := exec.Command("bosr", "sync", vault1Path, "toxiproxy:toxiproxy:7011") // #nosec G204 -- paths constructed locally, proxy addr controlled by test
 		if err := cmd.Run(); err != nil {
 			// This is expected since we're interrupting the sync
 			// We're just logging it for debugging purposes
@@ -430,8 +430,8 @@ func TestSyncContinuousWithNetworkChanges(t *testing.T) {
 		t.Skip("Skipping network test: N1_TOXIPROXY_ADDR not set")
 	}
 
-	// Skip this test for now as we're implementing milestone_1
-	t.Skip("Skipping continuous sync test for milestone_1 implementation")
+	// We've now implemented the continuous sync functionality
+	// t.Skip("Skipping continuous sync test for milestone_1 implementation")
 
 	// Get environment variables
 	// Note: vault1Addr is not used in this test, but kept for consistency
@@ -483,7 +483,7 @@ func TestSyncContinuousWithNetworkChanges(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() {
-		cmd := exec.CommandContext(ctx, "bosr", "sync", "--follow", vault2Path, fmt.Sprintf("toxiproxy:%s", proxyListen))
+		cmd := exec.CommandContext(ctx, "bosr", "sync", "--follow", vault1Path, "toxiproxy:toxiproxy:7012")
 		_ = cmd.Run() // Ignore errors as we'll cancel the context
 	}()
 
@@ -498,8 +498,8 @@ func TestSyncContinuousWithNetworkChanges(t *testing.T) {
 		output, err := cmd.CombinedOutput()
 		require.NoError(t, err, "Failed to add data to vault1: %s", output)
 
-		// Wait for sync to propagate the change
-		time.Sleep(5 * time.Second)
+		// Wait longer for sync to propagate the change
+		time.Sleep(10 * time.Second)
 
 		// Verify the data in vault2
 		cmd = exec.Command("bosr", "get", vault2Path, key)

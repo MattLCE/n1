@@ -10,7 +10,7 @@ Component	Status	Notes
 Protocol Design	✅ DONE (Specification)	docs/specs/mirror-protocol.md and docs/specs/merge.md are defined.
 Miror Core Library	🟡 Partially Implemented (Foundation)	Interfaces (ObjectStore, WAL, Transport), WAL (internal/miror/wal.go), basic TCP Transport (internal/miror/transport.go), message types/encoding exist.
 ✅ DONE (performPush)	Core Replicator.performPush method now fully implemented with proper object comparison and transfer logic.
-⌛ TODO (Core Logic)	Core Replicator methods (performPull, performFollow) still contain placeholder logic.
+🟡 Partially Implemented (Core Logic)	Core Replicator.performFollow still contains placeholder logic. Core Replicator.performPull is now fully implemented.
 ✅ DONE (ObjectStore)	ObjectStoreAdapter (cmd/bosr/sync.go, cmd/mirord/main.go) now uses real content hashing with SHA-256 of encrypted value blobs.
 Merge Specification	✅ DONE (Specification) <br> 🟡 Implemented (Code Structure) <br> ⌛ TODO (Integration)	Spec exists. internal/merge package defines structures but is not yet integrated into the sync/replication process.
 Sync Worker (mirord)	🟡 Partially Implemented (Foundation, Basic Server)	cmd/mirord daemon exists. Basic TCP listener and connection handler (handleConnection) structure is present. Server startup fixed (key retrieval). Relies on incomplete Replicator.
@@ -44,8 +44,8 @@ The client-side logic for listing local hashes, sending OFFER, receiving ACCEPT,
 ✅ DONE - Verify Basic Sync Tests:
 Basic sync tests are now passing, confirming that the push functionality works correctly.
 
-⌛ TODO - Implement Core Replicator.performPull:
-Implement the client-side logic for receiving OFFER, determining needed hashes, sending ACCEPT, and receiving/storing DATA messages.
+✅ DONE - Implement Core Replicator.performPull:
+The client-side logic for receiving OFFER, determining needed hashes, sending ACCEPT, and receiving/storing DATA messages has been implemented. The implementation includes proper error handling and WAL integration.
 
 ⌛ TODO - Implement Core Replicator.performFollow:
 Implement the continuous synchronization logic for the follow mode.
