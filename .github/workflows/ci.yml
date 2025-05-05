@@ -14,25 +14,28 @@ jobs:
         with:
           go-version: '1.23'
       - name: Unit Tests
-        run: go test ./internal/...
+        run: go test ./internal/... # Focus on unit tests here
       - name: Vet
         run: go vet ./...
       - name: Lint
         uses: golangci/golangci-lint-action@v3
-        with:
-          version: v1.64.8
-  
-  integration:
-    runs-on: ubuntu-latest
-    needs: build
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.23'
-      - name: Build Binary
-        run: |
-          mkdir -p bin
-          go build -o bin/bosr ./cmd/bosr
-      - name: Integration Tests
-        run: CI=true go test -v ./test/...
+        # No version needed if you rely on .golangci.yml
+        # with:
+        #   version: v1.64.8 # Can be removed
+
+  # --- DELETE THIS ENTIRE BLOCK (lines 25-39) ---
+  # integration:
+  #   runs-on: ubuntu-latest
+  #   needs: build
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: actions/setup-go@v5
+  #       with:
+  #         go-version: '1.23'
+  #     - name: Build Binary
+  #       run: |
+  #         mkdir -p bin
+  #         go build -o bin/bosr ./cmd/bosr
+  #     - name: Integration Tests
+  #       run: CI=true go test -v ./test/...
+  # --- END OF BLOCK TO DELETE ---

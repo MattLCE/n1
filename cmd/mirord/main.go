@@ -336,6 +336,9 @@ func runDaemon(config Config) error {
 	return nil
 }
 
+// --- START DEBUG LOGGING Variables ---
+var connectionCounter int // Simple counter for concurrent connections (not thread-safe, just for debug)
+// --- END DEBUG LOGGING Variables ---
 // handleConnection handles an incoming synchronization connection.
 // Server always sends OFFER first.
 func handleConnection(ctx context.Context, conn net.Conn, objectStore miror.ObjectStore, wal miror.WAL, config Config) {
@@ -343,66 +346,74 @@ func handleConnection(ctx context.Context, conn net.Conn, objectStore miror.Obje
 	transport, err := miror.NewTCPTransport("", config.TransportConfig) // Peer address is empty
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to create TCP transport for incoming connection")
-		conn.Close()
+		conn.Close() // Closes connection on error here
 		return
 	}
-	transport.SetConnection(conn)
-	defer transport.Close()
+	transport.SetConnection(conn) // Assign the accepted connection
+	defer transport.Close()       // Ensure transport (and underlying conn) is closed eventually
 
 	// Create a temporary session ID for logging/WAL
+	connectionCounter++ // Increment counter
 	var sessionID miror.SessionID
 	for i := range sessionID {
 		sessionID[i] = byte(i + 100)
 	} // Simple placeholder
-	log := log.Logger.With().Str("remote_addr", conn.RemoteAddr().String()).Str("session_id", sessionID.String()).Logger()
+	// Add connection number to log context
+	log := log.Logger.With().Str("remote_addr", conn.RemoteAddr().String()).Str("session_id", sessionID.String()).Int("conn_num", connectionCounter).Logger()
 
 	// --- Server Sends Offer First ---
-	log.Debug().Msg("Listing local objects to offer")
+	log.Info().Msg("Handling new connection.") // Log start
+
+	log.Info().Msg("Listing local objects to offer...") // Changed to Info for visibility
 	serverHashes, err := objectStore.ListObjects(ctx)
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to list objects for initial OFFER")
 		// TODO: Send ERROR message to client?
-		return
+		return // <-- Potential premature exit
 	}
+	log.Info().Int("count", len(serverHashes)).Msg("Object list retrieved.") // Changed to Info
 
-	log.Debug().Int("count", len(serverHashes)).Msg("Encoding initial OFFER") // Changed log message slightly
+	log.Info().Msg("Encoding initial OFFER...") // Changed to Info
 	offerBody, err := miror.EncodeOfferMessage(serverHashes)
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to encode initial OFFER")
-		return
+		return // <-- Potential premature exit
 	}
-	log.Debug().Msg("Attempting to send initial OFFER message...") // Corrected log
+	log.Info().Int("offer_body_size", len(offerBody)).Msg("OFFER encoded.") // Changed to Info
+
+	log.Info().Msg("Attempting to send initial OFFER message...") // Changed to Info
 	if err := transport.Send(ctx, miror.MessageTypeOffer, offerBody); err != nil {
 		log.Error().Err(err).Msg("Failed to send initial OFFER")
-		return
+		return // <-- Potential premature exit
 	}
-	log.Debug().Msg("Successfully sent initial OFFER") // Corrected log
+	log.Info().Msg("Successfully sent initial OFFER") // Changed to Info
 
 	// --- Wait for Client Response ---
-	log.Debug().Msg("Waiting for client response (ACCEPT, OFFER, or COMPLETE)")
+	log.Info().Msg("Waiting for client response (ACCEPT, OFFER, or COMPLETE)") // Changed to Info
 	msgType, clientRespBody, err := transport.Receive(ctx)
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to receive client response")
 		return
 	}
+	log.Info().Uint8("msg_type", msgType).Int("body_size", len(clientRespBody)).Msg("Received client response.") // Changed to Info
 
 	switch msgType {
 	case miror.MessageTypeAccept:
 		// Client wants objects from server's offer
-		log.Debug().Msg("Received ACCEPT from client")
+		log.Info().Msg("Received ACCEPT from client") // Changed to Info
 		hashesToSend, err := miror.DecodeAcceptMessage(clientRespBody)
 		if err != nil {
 			log.Error().Err(err).Msg("Failed to decode client ACCEPT")
 			return
 		}
-		log.Debug().Int("count", len(hashesToSend)).Msg("Client accepted objects")
+		log.Info().Int("count", len(hashesToSend)).Msg("Client accepted objects") // Changed to Info
 
 		if err := sendObjects(ctx, log, transport, objectStore, wal, sessionID, hashesToSend); err != nil {
 			log.Error().Err(err).Msg("Failed during server push (sending objects)")
 			return
 		}
 		// After sending objects, server expects COMPLETE from client
-		log.Debug().Msg("Waiting for final COMPLETE from client after server push")
+		log.Info().Msg("Waiting for final COMPLETE from client after server push") // Changed to Info
 		finalMsgType, _, err := transport.Receive(ctx)
 		if err != nil {
 			log.Error().Err(err).Msg("Failed to receive final COMPLETE from client")
@@ -412,11 +423,11 @@ func handleConnection(ctx context.Context, conn net.Conn, objectStore miror.Obje
 			log.Error().Uint8("msg_type", finalMsgType).Msg("Expected final COMPLETE from client, got something else")
 			return
 		}
-		log.Debug().Msg("Received final COMPLETE from client")
+		log.Info().Msg("Received final COMPLETE from client") // Changed to Info
 
 	case miror.MessageTypeOffer:
 		// Client wants to push its objects (handle client push)
-		log.Debug().Msg("Received OFFER from client")
+		log.Info().Msg("Received OFFER from client") // Changed to Info
 		if err := handleClientPush(ctx, log, transport, objectStore, wal, sessionID, clientRespBody); err != nil {
 			log.Error().Err(err).Msg("Failed during client push handling")
 			return
@@ -424,7 +435,7 @@ func handleConnection(ctx context.Context, conn net.Conn, objectStore miror.Obje
 
 	case miror.MessageTypeComplete:
 		// Client doesn't need anything and isn't pushing anything. Sync is done.
-		log.Debug().Msg("Received COMPLETE from client immediately, sync finished")
+		log.Info().Msg("Received COMPLETE from client immediately, sync finished") // Changed to Info
 
 	default:
 		log.Error().Uint8("msg_type", msgType).Msg("Received unexpected message type from client after initial server OFFER")

@@ -938,7 +938,10 @@ func DecodeDataMessage(data []byte) (ObjectHash, uint64, []byte, error) { // Exp
 
 // decodeAckMessage decodes an ACK message body.
 // Format: Object Hash (32 bytes) | Offset (8 bytes)
+// TODO(M2): Implement ACK handling and uncomment decodeAckMessage
 // Note: Currently unused in M1 push, but needed for pull/resume/M2 push.
+// Commenting out the signature as well to fix lint error for M1
+/*
 func decodeAckMessage(data []byte) (ObjectHash, uint64, error) { // Not Exported (internal helper)
 	expectedLen := objectHashSize + 8
 	if len(data) != expectedLen {
@@ -955,6 +958,7 @@ func decodeAckMessage(data []byte) (ObjectHash, uint64, error) { // Not Exported
 	}
 	return hash, offset, nil
 }
+*/
 
 // EncodeCompleteMessage encodes a COMPLETE message body.
 // Format: Session ID (32 bytes)

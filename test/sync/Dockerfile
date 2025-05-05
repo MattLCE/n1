@@ -36,5 +36,11 @@ WORKDIR /data
 
 # Default command
 # Note: Using mirord here, but vault1/vault2 services might need different CMDs?
-# Consider if the CMD should be defined in docker-compose.yml per service instead.
-CMD ["sh", "-c", "mirord --vault /data/vault.db --listen ${N1_LISTEN_ADDR} --verbose"]
+# Initialize vault if it doesn't exist, then start mirord
+# This ensures the key is in the container's secret store (file-based)
+CMD ["sh", "-c", "\
+     if [ ! -f /data/vault.db ]; then \
+       echo 'Initializing vault /data/vault.db...' && bosr init /data/vault.db; \
+     fi && \
+     echo 'Starting mirord...' && mirord --vault /data/vault.db --listen ${N1_LISTEN_ADDR} --verbose \
+"]
