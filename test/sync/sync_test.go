@@ -1,7 +1,9 @@
 package sync_test
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"fmt"
 	"io"
@@ -385,60 +387,137 @@ type TestObjectStore struct {
 	db        *sql.DB
 	vaultPath string
 	secureDAO *dao.SecureVaultDAO
+	// hashToKey maps object hashes to their keys in the vault
+	hashToKey map[string]string
+	// keyToHash maps keys to their content hashes
+	keyToHash map[string]miror.ObjectHash
 }
 
 // newTestObjectStore creates a new test object store
 func newTestObjectStore(db *sql.DB, vaultPath string, masterKey []byte) *TestObjectStore {
-	return &TestObjectStore{
+	store := &TestObjectStore{
 		db:        db,
 		vaultPath: vaultPath,
 		secureDAO: dao.NewSecureVaultDAO(db, masterKey),
+		hashToKey: make(map[string]string),
+		keyToHash: make(map[string]miror.ObjectHash),
 	}
+
+	// Initialize the hash mappings
+	store.initHashMappings()
+
+	return store
 }
 
-// GetObject gets an object by its hash
-func (s *TestObjectStore) GetObject(ctx context.Context, hash miror.ObjectHash) ([]byte, error) {
-	key := hash.String()
-	return s.secureDAO.Get(key)
-}
-
-// PutObject puts an object with the given hash and data
-func (s *TestObjectStore) PutObject(ctx context.Context, hash miror.ObjectHash, data []byte) error {
-	key := hash.String()
-	return s.secureDAO.Put(key, data)
-}
-
-// HasObject checks if an object exists
-func (s *TestObjectStore) HasObject(ctx context.Context, hash miror.ObjectHash) (bool, error) {
-	key := hash.String()
-	_, err := s.secureDAO.Get(key)
-	if err == dao.ErrNotFound {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
-// ListObjects lists all object hashes
-func (s *TestObjectStore) ListObjects(ctx context.Context) ([]miror.ObjectHash, error) {
+// initHashMappings initializes the hash-to-key and key-to-hash mappings
+func (s *TestObjectStore) initHashMappings() {
+	// List all keys in the vault
 	keys, err := s.secureDAO.List()
 	if err != nil {
-		return nil, err
+		return
 	}
 
-	var hashes []miror.ObjectHash
+	// Build the mappings
 	for _, key := range keys {
 		// Skip the canary record
 		if key == "__n1_canary__" {
 			continue
 		}
 
-		// Convert key to hash
-		var hash miror.ObjectHash
-		// In a real implementation, we would convert the key to a hash
-		// For now, we'll just use a placeholder
+		// Get the encrypted value
+		encryptedValue, err := s.secureDAO.Get(key)
+		if err != nil {
+			continue
+		}
+
+		// Compute the hash of the encrypted value
+		hash := s.computeObjectHash(encryptedValue)
+		hashStr := hash.String()
+
+		// Store the mappings
+		s.hashToKey[hashStr] = key
+		s.keyToHash[key] = hash
+	}
+}
+
+// computeObjectHash computes the SHA-256 hash of the encrypted value
+func (s *TestObjectStore) computeObjectHash(encryptedValue []byte) miror.ObjectHash {
+	var hash miror.ObjectHash
+	h := sha256.Sum256(encryptedValue)
+	copy(hash[:], h[:])
+	return hash
+}
+
+// GetObject gets an object by its hash
+func (s *TestObjectStore) GetObject(ctx context.Context, hash miror.ObjectHash) ([]byte, error) {
+	hashStr := hash.String()
+
+	// Look up the key for this hash
+	key, exists := s.hashToKey[hashStr]
+	if !exists {
+		return nil, dao.ErrNotFound
+	}
+
+	// Get the encrypted value
+	encryptedValue, err := s.secureDAO.Get(key)
+	if err != nil {
+		return nil, err
+	}
+
+	// Verify the hash matches
+	computedHash := s.computeObjectHash(encryptedValue)
+	if computedHash.String() != hashStr {
+		return nil, fmt.Errorf("hash mismatch for key %s", key)
+	}
+
+	return s.secureDAO.Get(key)
+}
+
+// PutObject puts an object with the given hash and data
+func (s *TestObjectStore) PutObject(ctx context.Context, hash miror.ObjectHash, data []byte) error {
+	// First, encrypt the data to get the encrypted blob
+	masterKey, err := secretstore.Default.Get(s.vaultPath)
+	if err != nil {
+		return fmt.Errorf("failed to get master key: %w", err)
+	}
+
+	encryptedData, err := crypto.EncryptBlob(masterKey, data)
+	if err != nil {
+		return fmt.Errorf("failed to encrypt data: %w", err)
+	}
+
+	// Compute the hash of the encrypted data
+	computedHash := s.computeObjectHash(encryptedData)
+
+	// Verify the hash matches what was provided
+	if !bytes.Equal(computedHash[:], hash[:]) {
+		return fmt.Errorf("hash mismatch: expected %s, got %s", hash.String(), computedHash.String())
+	}
+
+	// Use the hash as the key
+	key := hash.String()
+
+	// Store the mappings
+	s.hashToKey[key] = key
+	s.keyToHash[key] = hash
+
+	// Store the data
+	return s.secureDAO.Put(key, data)
+}
+
+// HasObject checks if an object exists
+func (s *TestObjectStore) HasObject(ctx context.Context, hash miror.ObjectHash) (bool, error) {
+	hashStr := hash.String()
+	_, exists := s.hashToKey[hashStr]
+	return exists, nil
+}
+
+// ListObjects lists all object hashes
+func (s *TestObjectStore) ListObjects(ctx context.Context) ([]miror.ObjectHash, error) {
+	var hashes []miror.ObjectHash
+
+	// Use the precomputed hashes from our mapping
+	for _, hash := range s.keyToHash {
 		hashes = append(hashes, hash)
 	}
 
@@ -447,12 +526,61 @@ func (s *TestObjectStore) ListObjects(ctx context.Context) ([]miror.ObjectHash, 
 
 // GetObjectReader gets a reader for an object
 func (s *TestObjectStore) GetObjectReader(ctx context.Context, hash miror.ObjectHash) (io.ReadCloser, error) {
-	// This is a placeholder implementation
-	return nil, fmt.Errorf("not implemented")
+	data, err := s.GetObject(ctx, hash)
+	if err != nil {
+		return nil, err
+	}
+	return io.NopCloser(bytes.NewReader(data)), nil
 }
 
 // GetObjectWriter gets a writer for an object
 func (s *TestObjectStore) GetObjectWriter(ctx context.Context, hash miror.ObjectHash) (io.WriteCloser, error) {
-	// This is a placeholder implementation
-	return nil, fmt.Errorf("not implemented")
+	buf := &bytes.Buffer{}
+	return &testObjectWriter{
+		buffer:      buf,
+		hash:        hash,
+		objectStore: s,
+		ctx:         ctx,
+	}, nil
+}
+
+// testObjectWriter is a WriteCloser that writes to a buffer and then to the object store when closed
+type testObjectWriter struct {
+	buffer      *bytes.Buffer
+	hash        miror.ObjectHash
+	objectStore *TestObjectStore
+	ctx         context.Context
+}
+
+func (w *testObjectWriter) Write(p []byte) (n int, err error) {
+	return w.buffer.Write(p)
+}
+
+func (w *testObjectWriter) Close() error {
+	// When closing the writer, we compute the actual hash of the encrypted data
+	// and verify it matches the expected hash
+	data := w.buffer.Bytes()
+
+	// Get the master key
+	masterKey, err := secretstore.Default.Get(w.objectStore.vaultPath)
+	if err != nil {
+		return fmt.Errorf("failed to get master key: %w", err)
+	}
+
+	// Encrypt the data
+	encryptedData, err := crypto.EncryptBlob(masterKey, data)
+	if err != nil {
+		return fmt.Errorf("failed to encrypt data: %w", err)
+	}
+
+	// Compute the hash of the encrypted data
+	computedHash := w.objectStore.computeObjectHash(encryptedData)
+
+	// If the hash doesn't match, we need to update it
+	if !bytes.Equal(computedHash[:], w.hash[:]) {
+		w.hash = computedHash
+	}
+
+	// Store the object with the correct hash
+	return w.objectStore.PutObject(w.ctx, w.hash, data)
 }
