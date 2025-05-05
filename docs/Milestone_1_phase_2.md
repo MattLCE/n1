@@ -9,8 +9,9 @@ Exit criteria	CI green on the above; docs & examples merged to main; v0.2.0-m1 t
 Component	Status	Notes
 Protocol Design	✅ DONE (Specification)	docs/specs/mirror-protocol.md and docs/specs/merge.md are defined.
 Miror Core Library	🟡 Partially Implemented (Foundation)	Interfaces (ObjectStore, WAL, Transport), WAL (internal/miror/wal.go), basic TCP Transport (internal/miror/transport.go), message types/encoding exist.
-⌛ TODO (Core Logic)	Core Replicator methods (performPush, performPull, performFollow) contain placeholder logic. Actual object comparison and transfer logic is missing.
-⚠️ Needs Refinement	ObjectStoreAdapter (cmd/bosr/sync.go, cmd/mirord/main.go) uses placeholder key-to-hash mapping; needs real content hashing.
+✅ DONE (performPush)	Core Replicator.performPush method now fully implemented with proper object comparison and transfer logic.
+⌛ TODO (Core Logic)	Core Replicator methods (performPull, performFollow) still contain placeholder logic.
+✅ DONE (ObjectStore)	ObjectStoreAdapter (cmd/bosr/sync.go, cmd/mirord/main.go) now uses real content hashing with SHA-256 of encrypted value blobs.
 Merge Specification	✅ DONE (Specification) <br> 🟡 Implemented (Code Structure) <br> ⌛ TODO (Integration)	Spec exists. internal/merge package defines structures but is not yet integrated into the sync/replication process.
 Sync Worker (mirord)	🟡 Partially Implemented (Foundation, Basic Server)	cmd/mirord daemon exists. Basic TCP listener and connection handler (handleConnection) structure is present. Server startup fixed (key retrieval). Relies on incomplete Replicator.
 ⌛ TODO (Features)	Peer discovery (mDNS) not implemented. Robust error handling and session management needed.
@@ -34,11 +35,20 @@ Merge rule edge-cases unanticipated	Med	Med	Early property-based fuzz tests; run
 Scope creep (e.g. gateway relay)	Med	Med	Defer to M2 "Mesh" milestone.
 Complexity of Merge Integration	Med	Med	Implement basic sync first, integrate merge carefully.
 5. Immediate Next Steps
-Implement Real Hashing in ObjectStoreAdapter:
-Modify GetObject, PutObject, HasObject, ListObjects to use content hashes (e.g., SHA-256) of the encrypted value blobs instead of placeholder keys. Decide if the hash will become the primary key or if an index mapping hash->key is needed.
-Implement Core Replicator.performPush:
-Implement the client-side logic for listing local hashes, sending OFFER, receiving ACCEPT, and sending requested DATA messages.
-Implement Core Replicator.performPull:
+✅ DONE - Implement Real Hashing in ObjectStoreAdapter:
+ObjectStoreAdapter now uses SHA-256 content hashes of the encrypted value blobs. The hash is used as the primary key with mappings maintained between hashes and keys.
+
+✅ DONE - Implement Core Replicator.performPush:
+The client-side logic for listing local hashes, sending OFFER, receiving ACCEPT, and sending requested DATA messages has been implemented. The implementation includes proper error handling and WAL integration.
+
+✅ DONE - Verify Basic Sync Tests:
+Basic sync tests are now passing, confirming that the push functionality works correctly.
+
+⌛ TODO - Implement Core Replicator.performPull:
 Implement the client-side logic for receiving OFFER, determining needed hashes, sending ACCEPT, and receiving/storing DATA messages.
-Verify Basic Network Test:
-Run make test-net. Aim to get TestSyncWithNetworkProfiles/normal-lan passing by verifying that data added to vault1 is correctly pushed to and retrievable from vault2, and vice-versa. Ignore failures in bad network conditions for now.
+
+⌛ TODO - Implement Core Replicator.performFollow:
+Implement the continuous synchronization logic for the follow mode.
+
+⌛ TODO - Complete Network Tests:
+Implement the remaining network tests for resumable transfers and continuous synchronization.

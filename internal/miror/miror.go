@@ -415,8 +415,26 @@ func (r *Replicator) performPush(ctx context.Context, session *Session, transpor
 		return fmt.Errorf("failed to list objects: %w", err)
 	}
 
-	// Send OFFER message
-	offerBody, err := EncodeOfferMessage(localHashes) // Use exported name
+	// Log the number of local objects found
+	if len(localHashes) == 0 {
+		// No objects to offer, send COMPLETE immediately
+		session.State = SessionStateCompleting
+		completeBody, err := EncodeCompleteMessage(session.ID)
+		if err != nil {
+			session.Error = err
+			return fmt.Errorf("failed to encode COMPLETE message: %w", err)
+		}
+		if err := transport.Send(ctx, MessageTypeComplete, completeBody); err != nil {
+			session.Error = err
+			return fmt.Errorf("failed to send COMPLETE message: %w", err)
+		}
+		session.State = SessionStateClosed
+		session.EndTime = time.Now()
+		return nil
+	}
+
+	// Send OFFER message with all local object hashes
+	offerBody, err := EncodeOfferMessage(localHashes)
 	if err != nil {
 		session.Error = err
 		return fmt.Errorf("failed to encode OFFER message: %w", err)
@@ -432,13 +450,21 @@ func (r *Replicator) performPush(ctx context.Context, session *Session, transpor
 		session.Error = err
 		return fmt.Errorf("failed to receive ACCEPT message: %w", err)
 	}
+
+	// Handle potential ERROR message from peer
+	if msgType == MessageTypeError {
+		errMsg := string(acceptBody)
+		session.Error = fmt.Errorf("peer returned error: %s", errMsg)
+		return session.Error
+	}
+
 	if msgType != MessageTypeAccept {
-		// TODO: Handle potential ERROR message from peer
 		session.Error = fmt.Errorf("unexpected message type %x received, expected ACCEPT (%x)", msgType, MessageTypeAccept)
 		return session.Error
 	}
 
-	hashesToPush, err := DecodeAcceptMessage(acceptBody) // Use exported name
+	// Decode the ACCEPT message to get the list of hashes the peer wants
+	hashesToPush, err := DecodeAcceptMessage(acceptBody)
 	if err != nil {
 		session.Error = err
 		return fmt.Errorf("failed to decode ACCEPT message: %w", err)
@@ -447,7 +473,7 @@ func (r *Replicator) performPush(ctx context.Context, session *Session, transpor
 	if len(hashesToPush) == 0 {
 		// Nothing to push, send COMPLETE immediately
 		session.State = SessionStateCompleting
-		completeBody, err := EncodeCompleteMessage(session.ID) // Use exported name
+		completeBody, err := EncodeCompleteMessage(session.ID)
 		if err != nil {
 			session.Error = err
 			return fmt.Errorf("failed to encode COMPLETE message: %w", err)
@@ -473,22 +499,39 @@ func (r *Replicator) performPush(ctx context.Context, session *Session, transpor
 			return fmt.Errorf("sync cancelled: %w", err)
 		}
 
-		// Log the send operation
+		// Log the send operation in WAL
 		if err := r.wal.LogSend(session.ID, hash); err != nil {
 			session.Error = err
 			return fmt.Errorf("failed to log send: %w", err)
 		}
 
-		// Get the object data
+		// Get the object data from local store
 		data, err := r.objectStore.GetObject(ctx, hash)
 		if err != nil {
 			session.Error = err
-			return fmt.Errorf("failed to get object: %w", err)
+			return fmt.Errorf("failed to get object %s: %w", hash, err)
+		}
+
+		// Check if we need to resume from a previous offset
+		offset, err := r.wal.GetProgress(session.ID, hash)
+		if err != nil && !errors.Is(err, ErrInvalidSession) {
+			session.Error = err
+			return fmt.Errorf("failed to get progress for %s: %w", hash, err)
 		}
 
 		// Send DATA message
-		// For M1, offset is always 0
-		dataBody, err := EncodeDataMessage(hash, 0, data) // Use exported name
+		// For M1, we're sending the entire object at once, so offset is always 0
+		// In M2, we would implement chunking and resume from the last offset
+		// 1. Validate the offset before converting
+		if offset < 0 {
+			// A negative offset is invalid in this context.
+			session.Error = fmt.Errorf("invalid negative offset %d for object %s", offset, hash)
+			return session.Error // Or handle the error appropriately
+		}
+		// 2. Now the conversion is safe because we know offset >= 0
+		safeOffset := uint64(offset)
+
+		dataBody, err := EncodeDataMessage(hash, safeOffset, data)
 		if err != nil {
 			session.Error = err
 			return fmt.Errorf("failed to encode DATA message for %s: %w", hash, err)
@@ -502,7 +545,6 @@ func (r *Replicator) performPush(ctx context.Context, session *Session, transpor
 
 		// Complete the transfer in WAL
 		if err := r.wal.CompleteTransfer(session.ID, hash); err != nil {
-			// Log error but try to continue if possible? Or fail hard? Fail hard for now.
 			session.Error = err
 			return fmt.Errorf("failed to complete transfer for %s: %w", hash, err)
 		}
@@ -521,7 +563,7 @@ func (r *Replicator) performPush(ctx context.Context, session *Session, transpor
 	session.State = SessionStateCompleting
 
 	// Send COMPLETE message
-	completeBody, err := EncodeCompleteMessage(session.ID) // Use exported name
+	completeBody, err := EncodeCompleteMessage(session.ID)
 	if err != nil {
 		session.Error = err
 		return fmt.Errorf("failed to encode COMPLETE message: %w", err)
