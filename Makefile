@@ -36,9 +36,15 @@ test-net: test-net-build
 
 # Run a specific network test
 test-net-%: test-net-build
-	# Changed docker-compose to docker compose
-	docker compose -f test/sync/docker-compose.yml up -d toxiproxy vault1 vault2
-	# Changed docker-compose to docker compose
-	docker compose -f test/sync/docker-compose.yml run test-runner /app/bin/sync.test -test.v -test.run $*
-	# Changed docker-compose to docker compose
-	docker compose -f test/sync/docker-compose.yml down
+	# Start services in detached mode
+	@echo "Starting background services (toxiproxy, vault1, vault2)..."
+	docker compose -f test/sync/docker-compose.yml up -d --build toxiproxy vault1 vault2
+	# Wait for services to initialize (adjust sleep time if needed)
+	@echo "Waiting 5 seconds for services to initialize..."
+	@sleep 5
+	# Run the test runner in the foreground
+	@echo "Running test: $*"
+	docker compose -f test/sync/docker-compose.yml run --rm test-runner /app/bin/sync.test -test.v -test.run $*
+	# Cleanup services and volumes
+	@echo "Cleaning up services and volumes..."
+	docker compose -f test/sync/docker-compose.yml down -v

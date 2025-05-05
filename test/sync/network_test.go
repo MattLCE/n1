@@ -10,9 +10,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/n1/n1/internal/crypto"
+	"github.com/n1/n1/internal/dao"
+	"github.com/n1/n1/internal/secretstore"
+	"github.com/n1/n1/internal/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -274,6 +279,205 @@ func (c *ToxiproxyClient) ApplyNetworkProfile(proxyName string, profile NetworkP
 	}
 
 	return nil
+}
+
+// TestSyncBasicNetwork tests basic push/pull functionality over the network proxy.
+func TestSyncBasicNetwork(t *testing.T) {
+	// Skip if Toxiproxy address is not set
+	if os.Getenv("N1_TOXIPROXY_ADDR") == "" {
+		t.Skip("Skipping network test: N1_TOXIPROXY_ADDR not set")
+	}
+
+	// Get environment variables
+	vault1Addr := os.Getenv("N1_VAULT1_ADDR")
+	if vault1Addr == "" {
+		vault1Addr = "vault1:7001" // Default service name and port
+	}
+	vault2Addr := os.Getenv("N1_VAULT2_ADDR")
+	if vault2Addr == "" {
+		vault2Addr = "vault2:7002" // Default service name and port
+	}
+
+	// Create Toxiproxy client
+	toxiClient := NewToxiproxyClient()
+
+	// Create proxy for vault1 -> vault2 communication
+	proxy1to2Name := "v1_to_v2_basic"
+	proxy1to2Listen := "0.0.0.0:7003" // Use a unique port for this test
+	proxy1to2Upstream := vault2Addr
+	err := toxiClient.CreateProxy(proxy1to2Name, proxy1to2Listen, proxy1to2Upstream)
+	// Allow proxy to already exist from previous failed run
+	if err != nil && !strings.Contains(err.Error(), "already exists") {
+		require.NoError(t, err, "Failed to create proxy %s", proxy1to2Name)
+	}
+	defer func() {
+		if err := toxiClient.DeleteProxy(proxy1to2Name); err != nil && !strings.Contains(err.Error(), "proxy not found") { // Allow proxy not found on cleanup
+			t.Logf("Warning: Failed to delete proxy %s: %v", proxy1to2Name, err)
+		}
+	}()
+
+	// Create proxy for vault2 -> vault1 communication
+	proxy2to1Name := "v2_to_v1_basic"
+	proxy2to1Listen := "0.0.0.0:7004" // Use a unique port for this test
+	proxy2to1Upstream := vault1Addr
+	err = toxiClient.CreateProxy(proxy2to1Name, proxy2to1Listen, proxy2to1Upstream)
+	// Allow proxy to already exist from previous failed run
+	if err != nil && !strings.Contains(err.Error(), "already exists") {
+		require.NoError(t, err, "Failed to create proxy %s", proxy2to1Name)
+	}
+	defer func() {
+		if err := toxiClient.DeleteProxy(proxy2to1Name); err != nil && !strings.Contains(err.Error(), "proxy not found") { // Allow proxy not found on cleanup
+			t.Logf("Warning: Failed to delete proxy %s: %v", proxy2to1Name, err)
+		}
+	}()
+
+	// Apply normal LAN profile to both proxies
+	err = toxiClient.ApplyNetworkProfile(proxy1to2Name, NormalLAN)
+	require.NoError(t, err, "Failed to apply profile to %s", proxy1to2Name)
+	err = toxiClient.ApplyNetworkProfile(proxy2to1Name, NormalLAN)
+	require.NoError(t, err, "Failed to apply profile to %s", proxy2to1Name)
+
+	// --- Test Setup ---
+	// *** CHANGE: Use paths within the mounted volume ***
+	// The test runner's working dir is /test, which contains the mounted ./test/sync
+	// The vault containers mount ./test/sync/data/vaultX to /data
+	// So, the test runner should manipulate files in /test/test/sync/data/vaultX
+	baseDataDir := "/test/test/sync/data" // Path within test-runner container
+	vault1Dir := filepath.Join(baseDataDir, "vault1")
+	vault2Dir := filepath.Join(baseDataDir, "vault2")
+	vault1Path := filepath.Join(vault1Dir, "vault.db") // This corresponds to /data/vault.db in vault1 container
+	vault2Path := filepath.Join(vault2Dir, "vault.db") // This corresponds to /data/vault.db in vault2 container
+
+	// Ensure the target directories exist within the runner container
+	err = os.MkdirAll(vault1Dir, 0755)
+	require.NoError(t, err, "Failed to create vault1 directory")
+	err = os.MkdirAll(vault2Dir, 0755)
+	require.NoError(t, err, "Failed to create vault2 directory")
+
+	// Clean up existing vault files before init
+	os.Remove(vault1Path)
+	os.Remove(vault2Path)
+	// Clean up potential backups/temp files from previous runs
+	os.Remove(vault1Path + ".bak")
+	os.Remove(vault1Path + ".tmp")
+	os.Remove(vault2Path + ".bak")
+	os.Remove(vault2Path + ".tmp")
+
+	// Initialize vaults (bosr init still creates the DB file)
+	cmd := exec.Command("bosr", "init", vault1Path)
+	output, err := cmd.CombinedOutput()
+	// We now EXPECT init to potentially fail key storage if run twice,
+	// or succeed but store under the wrong name. We'll overwrite/store manually.
+	t.Logf("Output from bosr init %s: %s (err: %v)", vault1Path, output, err)
+	// Check if vault file exists, ignore errors from init itself for now
+	_, statErr := os.Stat(vault1Path)
+	require.NoError(t, statErr, "Vault file %s should exist after init", vault1Path)
+
+	cmd = exec.Command("bosr", "init", vault2Path)
+	output, err = cmd.CombinedOutput()
+	t.Logf("Output from bosr init %s: %s (err: %v)", vault2Path, output, err)
+	_, statErr = os.Stat(vault2Path)
+	require.NoError(t, statErr, "Vault file %s should exist after init", vault2Path)
+
+	// --- Manually store keys with CONSISTENT names ---
+	// This bypasses bosr init's key storage mechanism for the test
+	key1Name := "vault_vault1"
+	key2Name := "vault_vault2"
+	secretStorePath := os.Getenv("N1_SECRET_STORE_PATH") // Get base path
+	require.NotEmpty(t, secretStorePath, "N1_SECRET_STORE_PATH must be set")
+
+	// Create key for vault 1
+	mk1, err := crypto.Generate(32)
+	require.NoError(t, err)
+	err = secretstore.Default.Put(key1Name, mk1) // Use consistent name
+	require.NoError(t, err, "Failed to manually store key for %s", key1Name)
+	t.Logf("Manually stored key for %s in %s", key1Name, secretStorePath)
+
+	// Create key for vault 2
+	mk2, err := crypto.Generate(32)
+	require.NoError(t, err)
+	err = secretstore.Default.Put(key2Name, mk2) // Use consistent name
+	require.NoError(t, err, "Failed to manually store key for %s", key2Name)
+	t.Logf("Manually stored key for %s in %s", key2Name, secretStorePath)
+
+	// Add canary records manually using the correct key
+	db1, err := sqlite.Open(vault1Path)
+	require.NoError(t, err)
+	defer db1.Close()
+	dao1 := dao.NewSecureVaultDAO(db1, mk1)
+	err = dao1.Put("__n1_canary__", []byte("ok"))
+	require.NoError(t, err, "Failed to put canary in vault1")
+
+	db2, err := sqlite.Open(vault2Path)
+	require.NoError(t, err)
+	defer db2.Close()
+	dao2 := dao.NewSecureVaultDAO(db2, mk2)
+	err = dao2.Put("__n1_canary__", []byte("ok"))
+	require.NoError(t, err, "Failed to put canary in vault2")
+	// --- End Manual Key Storage ---
+
+	// --- Test Push v1 -> v2 ---
+	t.Logf("Testing Push: %s -> %s", vault1Path, vault2Path)
+	key1 := "hello"
+	value1 := "world"
+	cmd = exec.Command("bosr", "put", vault1Path, key1, value1)
+	output, err = cmd.CombinedOutput()
+	require.NoError(t, err, "Failed to put key '%s' in vault1: %s", key1, output)
+
+	// Sync (default is Pull from client perspective, server offers) from vault1 to vault2 via proxy
+	syncTarget1to2 := "toxiproxy:toxiproxy:7003" // Connect to the proxy listening for vault2
+	cmd = exec.Command("bosr", "sync", vault1Path, syncTarget1to2)
+	output, err = cmd.CombinedOutput()
+	// Add detailed output logging on failure
+	if err != nil {
+		t.Logf("Sync v1 -> v2 command output:\n%s", string(output))
+	}
+	require.NoError(t, err, "Failed to sync v1 -> v2")
+
+	// Verify data in vault2
+	cmd = exec.Command("bosr", "get", vault2Path, key1)
+	output, err = cmd.CombinedOutput()
+	require.NoError(t, err, "Failed to get key '%s' from vault2: %s", key1, output)
+	assert.Equal(t, value1, string(bytes.TrimSpace(output)), "Value mismatch for key '%s' in vault2", key1)
+
+	// --- Test Push v2 -> v1 ---
+	t.Logf("Testing Push: %s -> %s", vault2Path, vault1Path)
+	key2 := "foo"
+	value2 := "bar"
+	cmd = exec.Command("bosr", "put", vault2Path, key2, value2)
+	output, err = cmd.CombinedOutput()
+	require.NoError(t, err, "Failed to put key '%s' in vault2: %s", key2, output)
+
+	// Sync (default is Pull from client perspective, server offers) from vault2 to vault1 via proxy
+	syncTarget2to1 := "toxiproxy:toxiproxy:7004" // Connect to the proxy listening for vault1
+	cmd = exec.Command("bosr", "sync", vault2Path, syncTarget2to1)
+	output, err = cmd.CombinedOutput()
+	// Add detailed output logging on failure
+	if err != nil {
+		t.Logf("Sync v2 -> v1 command output:\n%s", string(output))
+	}
+	require.NoError(t, err, "Failed to sync v2 -> v1")
+
+	// Verify data in vault1
+	cmd = exec.Command("bosr", "get", vault1Path, key2)
+	output, err = cmd.CombinedOutput()
+	require.NoError(t, err, "Failed to get key '%s' from vault1: %s", key2, output)
+	assert.Equal(t, value2, string(bytes.TrimSpace(output)), "Value mismatch for key '%s' in vault1", key2)
+
+	// --- Final Check: Verify both vaults have both keys ---
+	// Vault 1 should now have key1 (original) and key2 (synced from v2)
+	cmd = exec.Command("bosr", "get", vault1Path, key1)
+	output, err = cmd.CombinedOutput()
+	require.NoError(t, err, "Final check: Failed to get key '%s' from vault1: %s", key1, output)
+	assert.Equal(t, value1, string(bytes.TrimSpace(output)), "Final check: Value mismatch for key '%s' in vault1", key1)
+
+	// Vault 2 should now have key1 (synced from v1) and key2 (original)
+	cmd = exec.Command("bosr", "get", vault2Path, key2)
+	output, err = cmd.CombinedOutput()
+	require.NoError(t, err, "Final check: Failed to get key '%s' from vault2: %s", key2, output)
+	assert.Equal(t, value2, string(bytes.TrimSpace(output)), "Final check: Value mismatch for key '%s' in vault2", key2)
+
+	t.Log("Basic network sync test completed successfully")
 }
 
 // TestSyncWithNetworkProfiles tests synchronization with different network profiles
