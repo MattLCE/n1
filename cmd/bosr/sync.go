@@ -19,6 +19,7 @@ import (
 	"github.com/n1/n1/internal/miror"
 	"github.com/n1/n1/internal/secretstore"
 	"github.com/n1/n1/internal/sqlite"
+	"github.com/n1/n1/internal/vaultid"
 	"github.com/rs/zerolog"
 	"github.com/urfave/cli/v2"
 )
@@ -119,10 +120,31 @@ func (a *ObjectStoreAdapter) GetObject(ctx context.Context, hash miror.ObjectHas
 
 // PutObject puts an object with the given hash and data
 func (a *ObjectStoreAdapter) PutObject(ctx context.Context, hash miror.ObjectHash, data []byte) error {
-	// First, encrypt the data to get the encrypted blob
-	masterKey, err := secretstore.Default.Get(a.vaultPath)
-	if err != nil {
-		return fmt.Errorf("failed to get master key: %w", err)
+	// First, try to get the vault ID
+	vaultID, err := vaultid.GetVaultIDFromPath(a.vaultPath)
+	var masterKey []byte
+
+	if err == nil {
+		// If vault ID exists, try to get the key using the vault ID
+		secretName := vaultid.FormatSecretName(vaultID)
+		masterKey, err = secretstore.Default.Get(secretName)
+		if err != nil {
+			// Fall back to path-based method
+			log.Debug().Err(err).Str("vault_id", vaultID).Msg("Failed to get key using vault ID, falling back to path-based method")
+			masterKey, err = secretstore.Default.Get(a.vaultPath)
+			if err != nil {
+				return fmt.Errorf("failed to get master key: %w", err)
+			}
+		} else {
+			log.Debug().Str("vault_id", vaultID).Msg("Retrieved master key using vault ID")
+		}
+	} else {
+		// If vault ID doesn't exist, try to get the key using the path
+		log.Debug().Err(err).Msg("Failed to get vault ID, falling back to path-based method")
+		masterKey, err = secretstore.Default.Get(a.vaultPath)
+		if err != nil {
+			return fmt.Errorf("failed to get master key: %w", err)
+		}
 	}
 
 	encryptedData, err := crypto.EncryptBlob(masterKey, data)
@@ -208,10 +230,31 @@ func (w *objectWriter) Close() error {
 	// and verify it matches the expected hash
 	data := w.buffer.Bytes()
 
-	// Get the master key
-	masterKey, err := secretstore.Default.Get(w.objectStore.vaultPath)
-	if err != nil {
-		return fmt.Errorf("failed to get master key: %w", err)
+	// Try to get the vault ID
+	vaultID, err := vaultid.GetVaultIDFromPath(w.objectStore.vaultPath)
+	var masterKey []byte
+
+	if err == nil {
+		// If vault ID exists, try to get the key using the vault ID
+		secretName := vaultid.FormatSecretName(vaultID)
+		masterKey, err = secretstore.Default.Get(secretName)
+		if err != nil {
+			// Fall back to path-based method
+			log.Debug().Err(err).Str("vault_id", vaultID).Msg("Failed to get key using vault ID, falling back to path-based method")
+			masterKey, err = secretstore.Default.Get(w.objectStore.vaultPath)
+			if err != nil {
+				return fmt.Errorf("failed to get master key: %w", err)
+			}
+		} else {
+			log.Debug().Str("vault_id", vaultID).Msg("Retrieved master key using vault ID")
+		}
+	} else {
+		// If vault ID doesn't exist, try to get the key using the path
+		log.Debug().Err(err).Msg("Failed to get vault ID, falling back to path-based method")
+		masterKey, err = secretstore.Default.Get(w.objectStore.vaultPath)
+		if err != nil {
+			return fmt.Errorf("failed to get master key: %w", err)
+		}
 	}
 
 	// Encrypt the data
@@ -306,82 +349,116 @@ var syncCmd = &cli.Command{
 			log.SetLevel(zerolog.DebugLevel)
 		}
 
-		// Get the master key from the secret store
-		mk, err := secretstore.Default.Get(vaultPath)
-		if err != nil {
-			return fmt.Errorf("failed to get key from secret store: %w", err)
-		}
-
-		// Open the database
+		// Get the vault ID and use it to get the master key from the secret store
 		db, err := sqlite.Open(vaultPath)
 		if err != nil {
 			return fmt.Errorf("failed to open database file '%s': %w", vaultPath, err)
 		}
 		defer db.Close()
 
-		// Create the object store adapter
-		objectStore := NewObjectStoreAdapter(db, vaultPath, mk)
-
-		// Create the WAL
-		wal, err := miror.NewWAL(walPath, 1024*1024) // 1MB sync interval
+		// Get the vault ID
+		vaultID, err := vaultid.GetVaultID(db)
 		if err != nil {
-			return fmt.Errorf("failed to create WAL: %w", err)
-		}
-		defer wal.Close()
-
-		// Create the sync configuration
-		syncConfig := miror.DefaultSyncConfig()
-		if push {
-			syncConfig.Mode = miror.SyncModePush
-		} else {
-			syncConfig.Mode = miror.SyncModePull
-		}
-		if follow {
-			syncConfig.Mode = miror.SyncModeFollow
-		}
-
-		// Create the replicator
-		replicator := miror.NewReplicator(syncConfig, objectStore, wal)
-
-		// Create a context with timeout
-		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second)
-		defer cancel()
-
-		// Handle signals for graceful shutdown
-		signalCh := make(chan os.Signal, 1)
-		signal.Notify(signalCh, syscall.SIGINT, syscall.SIGTERM)
-		go func() {
-			sig := <-signalCh
-			log.Info().Str("signal", sig.String()).Msg("Received signal, shutting down")
-			cancel()
-		}()
-
-		// Progress callback
-		progress := func(current, total int64, objectHash miror.ObjectHash) {
-			if verbose || total > 1024*1024 { // Always show progress for transfers > 1MB
-				percent := float64(current) / float64(total) * 100
-				log.Info().
-					Int64("current", current).
-					Int64("total", total).
-					Float64("percent", percent).
-					Str("object", objectHash.String()).
-					Msg("Sync progress")
+			// Fall back to path-based method if vault ID is not available
+			log.Warn().Err(err).Msg("Failed to get vault ID, falling back to path-based method")
+			mk, err := secretstore.Default.Get(vaultPath)
+			if err != nil {
+				return fmt.Errorf("failed to get key from secret store: %w", err)
 			}
+			return runSync(c, vaultPath, peer, follow, push, walPath, timeout, verbose, mk)
 		}
 
-		// Perform the sync operation
-		log.Info().
-			Str("vault", vaultPath).
-			Str("peer", peer).
-			Str("mode", syncConfig.Mode.String()).
-			Msg("Starting synchronization")
+		// Format the secret name using the vault ID
+		secretName := vaultid.FormatSecretName(vaultID)
+		log.Info().Str("vault_id", vaultID).Msg("Using vault ID for key retrieval")
 
-		err = replicator.SyncWithProgress(ctx, peer, syncConfig, progress)
+		// Get the master key using the vault ID-based secret name
+		mk, err := secretstore.Default.Get(secretName)
 		if err != nil {
-			return fmt.Errorf("synchronization failed: %w", err)
+			// Fall back to path-based method if vault ID-based retrieval fails
+			log.Warn().Err(err).Str("vault_id", vaultID).Msg("Failed to get key using vault ID, falling back to path-based method")
+			mk, err := secretstore.Default.Get(vaultPath)
+			if err != nil {
+				return fmt.Errorf("failed to get key from secret store: %w", err)
+			}
+			return runSync(c, vaultPath, peer, follow, push, walPath, timeout, verbose, mk)
 		}
 
-		log.Info().Msg("Synchronization completed successfully")
-		return nil
+		return runSync(c, vaultPath, peer, follow, push, walPath, timeout, verbose, mk)
 	},
+}
+
+// runSync runs the sync operation with the given parameters
+func runSync(c *cli.Context, vaultPath, peer string, follow, push bool, walPath string, timeout int, verbose bool, mk []byte) error {
+	// Open the database
+	db, err := sqlite.Open(vaultPath)
+	if err != nil {
+		return fmt.Errorf("failed to open database file '%s': %w", vaultPath, err)
+	}
+	defer db.Close()
+
+	// Create the object store adapter
+	objectStore := NewObjectStoreAdapter(db, vaultPath, mk)
+
+	// Create the WAL
+	wal, err := miror.NewWAL(walPath, 1024*1024) // 1MB sync interval
+	if err != nil {
+		return fmt.Errorf("failed to create WAL: %w", err)
+	}
+	defer wal.Close()
+
+	// Create the sync configuration
+	syncConfig := miror.DefaultSyncConfig()
+	if push {
+		syncConfig.Mode = miror.SyncModePush
+	} else {
+		syncConfig.Mode = miror.SyncModePull
+	}
+	if follow {
+		syncConfig.Mode = miror.SyncModeFollow
+	}
+
+	// Create the replicator
+	replicator := miror.NewReplicator(syncConfig, objectStore, wal)
+
+	// Create a context with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second)
+	defer cancel()
+
+	// Handle signals for graceful shutdown
+	signalCh := make(chan os.Signal, 1)
+	signal.Notify(signalCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		sig := <-signalCh
+		log.Info().Str("signal", sig.String()).Msg("Received signal, shutting down")
+		cancel()
+	}()
+
+	// Progress callback
+	progress := func(current, total int64, objectHash miror.ObjectHash) {
+		if verbose || total > 1024*1024 { // Always show progress for transfers > 1MB
+			percent := float64(current) / float64(total) * 100
+			log.Info().
+				Int64("current", current).
+				Int64("total", total).
+				Float64("percent", percent).
+				Str("object", objectHash.String()).
+				Msg("Sync progress")
+		}
+	}
+
+	// Perform the sync operation
+	log.Info().
+		Str("vault", vaultPath).
+		Str("peer", peer).
+		Str("mode", syncConfig.Mode.String()).
+		Msg("Starting synchronization")
+
+	err = replicator.SyncWithProgress(ctx, peer, syncConfig, progress)
+	if err != nil {
+		return fmt.Errorf("synchronization failed: %w", err)
+	}
+
+	log.Info().Msg("Synchronization completed successfully")
+	return nil
 }

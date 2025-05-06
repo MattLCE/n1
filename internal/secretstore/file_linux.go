@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"strings"
 )
 
 func init() { Default = fileStore{} }
@@ -20,12 +21,18 @@ func (f fileStore) path(name string) (string, error) { // Added error return
 	if err != nil {
 		return "", fmt.Errorf("failed to get current user: %w", err)
 	}
-	// Check if name is absolute, might be needed for robust path joining
+	// Check if name starts with the vault ID prefix
+	if strings.HasPrefix(name, "n1_vault_") {
+		// This is a vault ID-based name, not a path, so we don't need to check if it's absolute
+		// Just use it as a filename in the .n1-secrets directory
+		return filepath.Join(u.HomeDir, ".n1-secrets", name), nil
+	}
+
+	// For path-based names, check if the path is absolute
 	if !filepath.IsAbs(name) {
 		// This wasn't explicitly handled before, but relying on the absolute path
-		// being passed seems to be the implicit contract. We could add an error here,
-		// but let's keep it closer to original for now.
-		// return "", fmt.Errorf("secret name (vault path) must be absolute: %s", name)
+		// being passed seems to be the implicit contract.
+		return "", fmt.Errorf("secret name (vault path) must be absolute: %s", name)
 	}
 	// Original logic joined HomeDir + .n1-secrets + name
 	// This could create deeply nested structures like /root/.n1-secrets/test/test/sync/data/vault1/vault.db

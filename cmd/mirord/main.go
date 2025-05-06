@@ -25,6 +25,7 @@ import (
 	"github.com/n1/n1/internal/miror"
 	"github.com/n1/n1/internal/secretstore"
 	"github.com/n1/n1/internal/sqlite"
+	"github.com/n1/n1/internal/vaultid"
 	"github.com/rs/zerolog"
 	"github.com/urfave/cli/v2"
 )
@@ -125,6 +126,7 @@ func removePIDFile(path string) error {
 type ObjectStoreAdapter struct {
 	db        *sql.DB
 	vaultPath string
+	vaultID   string              // Store the vault ID for key retrieval
 	secureDAO *dao.SecureVaultDAO // Used for Put/Get operations needing encryption/decryption
 	// hashToKey maps object hashes (as strings) to their user-defined keys in the vault
 	hashToKey map[string]string
@@ -134,9 +136,18 @@ type ObjectStoreAdapter struct {
 
 // NewObjectStoreAdapter creates a new adapter for the vault
 func NewObjectStoreAdapter(db *sql.DB, vaultPath string, masterKey []byte) *ObjectStoreAdapter {
+	// Try to get the vault ID
+	vaultID, err := vaultid.GetVaultID(db)
+	if err != nil {
+		// If we can't get the vault ID, just log a warning
+		log.Warn().Err(err).Msg("Failed to get vault ID in NewObjectStoreAdapter")
+		vaultID = "" // Use empty string as fallback
+	}
+
 	adapter := &ObjectStoreAdapter{
 		db:        db,
 		vaultPath: vaultPath,
+		vaultID:   vaultID,
 		secureDAO: dao.NewSecureVaultDAO(db, masterKey), // Initialize Secure DAO
 		hashToKey: make(map[string]string),
 		keyToHash: make(map[string]miror.ObjectHash),
@@ -285,10 +296,31 @@ func (a *ObjectStoreAdapter) PutObject(ctx context.Context, hash miror.ObjectHas
 	log.Debug().Str("hash", hashStr).Int("data_size", len(data)).Msg("ObjectStoreAdapter.PutObject called")
 
 	// Get the master key (needed for encryption by SecureDAO)
-	masterKey, err := secretstore.Default.Get(a.vaultPath)
-	if err != nil {
-		log.Error().Err(err).Str("vaultPath", a.vaultPath).Msg("ObjectStoreAdapter.PutObject: Failed to get master key")
-		return fmt.Errorf("failed to get master key: %w", err)
+	// Try to get the vault ID from the database
+	vaultID, err := vaultid.GetVaultID(a.db)
+	var masterKey []byte
+
+	if err == nil {
+		// If vault ID exists, try to get the key using the vault ID
+		secretName := vaultid.FormatSecretName(vaultID)
+		masterKey, err = secretstore.Default.Get(secretName)
+		if err != nil {
+			log.Debug().Err(err).Str("vault_id", vaultID).Msg("ObjectStoreAdapter.PutObject: Failed to get key using vault ID")
+
+			// Fall back to path-based method
+			masterKey, err = secretstore.Default.Get(a.vaultPath)
+			if err != nil {
+				log.Error().Err(err).Str("vaultPath", a.vaultPath).Msg("ObjectStoreAdapter.PutObject: Failed to get master key")
+				return fmt.Errorf("failed to get master key: %w", err)
+			}
+		}
+	} else {
+		// If vault ID doesn't exist, try to get the key using the path
+		masterKey, err = secretstore.Default.Get(a.vaultPath)
+		if err != nil {
+			log.Error().Err(err).Str("vaultPath", a.vaultPath).Msg("ObjectStoreAdapter.PutObject: Failed to get master key")
+			return fmt.Errorf("failed to get master key: %w", err)
+		}
 	}
 
 	// Encrypt the data temporarily to compute the hash *of the encrypted blob*
@@ -538,14 +570,8 @@ func runDaemon(config Config) error {
 
 	// Get master key
 	log.Info().Str("vaultPath", config.VaultPath).Msg("Attempting to retrieve master key...")
-	mk, err := secretstore.Default.Get(config.VaultPath)
-	if err != nil {
-		log.Error().Err(err).Str("vaultPath", config.VaultPath).Msg("Failed to get master key from secret store")
-		return fmt.Errorf("failed to get key from secret store for vault %s: %w", config.VaultPath, err)
-	}
-	log.Info().Msg("Master key retrieved successfully")
 
-	// Open DB
+	// Open DB first to get the vault ID
 	log.Info().Str("vaultPath", config.VaultPath).Msg("Attempting to open database...")
 	db, err := sqlite.Open(config.VaultPath)
 	if err != nil {
@@ -561,6 +587,62 @@ func runDaemon(config Config) error {
 		}
 	}()
 	log.Info().Msg("Database opened successfully")
+
+	// Try to get the vault ID from the metadata table
+	vaultID, err := vaultid.GetVaultID(db)
+	var mk []byte
+
+	if err == nil {
+		// If vault ID exists, try to get the key using the vault ID
+		secretName := vaultid.FormatSecretName(vaultID)
+		mk, err = secretstore.Default.Get(secretName)
+		if err == nil {
+			log.Info().Str("vault_id", vaultID).Msg("Master key retrieved successfully using vault ID")
+		} else {
+			log.Debug().Err(err).Str("vault_id", vaultID).Msg("Failed to get key using vault ID")
+
+			// Fall back to path-based method
+			mk, err = secretstore.Default.Get(config.VaultPath)
+			if err != nil {
+				log.Error().Err(err).Str("vaultPath", config.VaultPath).Msg("Failed to get master key from secret store")
+				return fmt.Errorf("failed to get key from secret store for vault %s: %w", config.VaultPath, err)
+			}
+			log.Info().Str("path", config.VaultPath).Msg("Master key retrieved successfully using path (legacy method)")
+
+			// Migrate the key to the UUID-based method
+			if err = secretstore.Default.Put(secretName, mk); err != nil {
+				log.Warn().Err(err).Str("vault_id", vaultID).Msg("Failed to migrate key to UUID-based storage")
+			} else {
+				log.Info().Str("vault_id", vaultID).Msg("Key migrated to UUID-based storage")
+			}
+		}
+	} else {
+		// If vault ID doesn't exist, try to get the key using the path
+		log.Debug().Err(err).Msg("Failed to get vault ID, falling back to path-based method")
+
+		mk, err = secretstore.Default.Get(config.VaultPath)
+		if err != nil {
+			log.Error().Err(err).Str("vaultPath", config.VaultPath).Msg("Failed to get master key from secret store")
+			return fmt.Errorf("failed to get key from secret store for vault %s: %w", config.VaultPath, err)
+		}
+		log.Info().Str("path", config.VaultPath).Msg("Master key retrieved successfully using path (legacy method)")
+
+		// Generate a vault ID and store it in the metadata table
+		vaultID, err = vaultid.EnsureVaultID(db)
+		if err != nil {
+			log.Warn().Err(err).Msg("Failed to generate vault ID")
+		} else {
+			// Migrate the key to the UUID-based method
+			secretName := vaultid.FormatSecretName(vaultID)
+			if err = secretstore.Default.Put(secretName, mk); err != nil {
+				log.Warn().Err(err).Str("vault_id", vaultID).Msg("Failed to migrate key to UUID-based storage")
+			} else {
+				log.Info().Str("vault_id", vaultID).Msg("Key migrated to UUID-based storage")
+			}
+		}
+	}
+
+	// DB is already opened above
 
 	// Create ObjectStore and WAL
 	log.Info().Msg("Creating Object Store Adapter...")

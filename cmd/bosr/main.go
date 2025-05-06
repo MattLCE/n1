@@ -18,6 +18,7 @@ import (
 	"github.com/n1/n1/internal/migrations"
 	"github.com/n1/n1/internal/secretstore"
 	"github.com/n1/n1/internal/sqlite"
+	"github.com/n1/n1/internal/vaultid"
 
 	"github.com/rs/zerolog"
 	"github.com/urfave/cli/v2"
@@ -36,7 +37,8 @@ func main() {
 			keyCmd, // Keep the top-level key command structure
 			putCmd,
 			getCmd,
-			syncCmd, // Add the sync command
+			syncCmd,    // Add the sync command
+			migrateCmd, // Add the migrate command
 		},
 	}
 
@@ -77,49 +79,57 @@ var initCmd = &cli.Command{
 		//     return fmt.Errorf("key already exists for path: %s", path)
 		// }
 
-		// 1· generate master-key (for application-level encryption)
+		// 1· create *plaintext* DB file by opening it
+		db, err := sqlite.Open(path)
+		if err != nil {
+			return fmt.Errorf("failed to create database file '%s': %w", path, err)
+		}
+		defer db.Close() // Ensure DB is closed
+
+		// 2· Run migrations to bootstrap the vault table and metadata table
+		log.Info().Msg("Running migrations to initialize vault schema...")
+		if err := migrations.BootstrapVault(db); err != nil {
+			return fmt.Errorf("failed to initialize vault schema: %w", err)
+		}
+
+		// 3· Generate a vault ID and store it in the metadata table
+		vaultID, err := vaultid.EnsureVaultID(db)
+		if err != nil {
+			return fmt.Errorf("failed to generate vault ID: %w", err)
+		}
+		log.Info().Str("vault_id", vaultID).Msg("Vault ID generated and stored")
+
+		// 4· Generate master-key (for application-level encryption)
 		mk, err := crypto.Generate(32)
 		if err != nil {
 			return fmt.Errorf("failed to generate master key: %w", err)
 		}
 
-		// 2· persist in secret store
-		if err = secretstore.Default.Put(path, mk); err != nil {
-			// Consider if we should attempt cleanup if this fails
+		// 5· Persist in secret store using the vault ID
+		secretName := vaultid.FormatSecretName(vaultID)
+		if err = secretstore.Default.Put(secretName, mk); err != nil {
 			return fmt.Errorf("failed to store master key: %w", err)
 		}
-		log.Info().Str("path", path).Msg("Master key generated and stored")
+		log.Info().Str("vault_id", vaultID).Msg("Master key generated and stored")
 
-		// 3· create *plaintext* DB file by opening it
-		// The Open function now only takes the path.
-		db, err := sqlite.Open(path)
-		if err != nil {
-			// If DB creation fails, should we remove the key we just stored?
-			_ = secretstore.Default.Delete(path) // Cleanup key if DB creation fails
-			return fmt.Errorf("failed to create database file '%s': %w", path, err)
-		}
-		defer db.Close() // Ensure DB is closed
-
-		// 4· Run migrations to bootstrap the vault table
-		log.Info().Msg("Running migrations to initialize vault schema...")
-		if err := migrations.BootstrapVault(db); err != nil {
-			// If migrations fail, clean up
-			_ = secretstore.Default.Delete(path)
-			return fmt.Errorf("failed to initialize vault schema: %w", err)
+		// 6· Also store using the path for backward compatibility
+		if err = secretstore.Default.Put(path, mk); err != nil {
+			log.Warn().Err(err).Msg("Failed to store master key using path (backward compatibility)")
 		}
 
-		// Add a canary record for key verification
+		// 7· Add a canary record for key verification
 		secureDAO := dao.NewSecureVaultDAO(db, mk)
 		canaryKey := "__n1_canary__"
 		canaryPlaintext := []byte("ok")
 		if err := secureDAO.Put(canaryKey, canaryPlaintext); err != nil {
 			// If canary creation fails, clean up
+			_ = secretstore.Default.Delete(secretName)
 			_ = secretstore.Default.Delete(path)
 			return fmt.Errorf("failed to create canary record: %w", err)
 		}
 		log.Debug().Msg("Added canary record for key verification")
 
-		log.Info().Str("path", path).Msg("Plaintext vault file created and initialized")
+		log.Info().Str("path", path).Str("vault_id", vaultID).Msg("Plaintext vault file created and initialized")
 		return nil
 	},
 }
@@ -137,27 +147,76 @@ var openCmd = &cli.Command{
 			return fmt.Errorf("failed to get absolute path: %w", err)
 		}
 
-		// 1. Check if the key exists in the secret store
-		mk, err := secretstore.Default.Get(path)
-		if err != nil {
-			return fmt.Errorf("failed to get key from secret store (does it exist?): %w", err)
-		}
-		log.Info().Str("path", path).Msg("Key found in secret store")
-
-		// 2. Try opening the plaintext DB file
+		// 1. Try opening the plaintext DB file
 		db, err := sqlite.Open(path)
 		if err != nil {
 			return fmt.Errorf("failed to open database file '%s': %w", path, err)
 		}
 		defer db.Close() // Ensure DB is closed
 
-		// 3. Verify the key can decrypt data in the vault
+		// 2. Try to get the vault ID from the metadata table
+		vaultID, err := vaultid.GetVaultID(db)
+		var mk []byte
+
+		if err == nil {
+			// 3a. If vault ID exists, try to get the key using the vault ID
+			secretName := vaultid.FormatSecretName(vaultID)
+			mk, err = secretstore.Default.Get(secretName)
+			if err == nil {
+				log.Info().Str("vault_id", vaultID).Msg("Key found in secret store using vault ID")
+			} else {
+				log.Debug().Err(err).Str("vault_id", vaultID).Msg("Failed to get key using vault ID")
+
+				// 3b. Fall back to path-based method
+				mk, err = secretstore.Default.Get(path)
+				if err != nil {
+					return fmt.Errorf("failed to get key from secret store (does it exist?): %w", err)
+				}
+				log.Info().Str("path", path).Msg("Key found in secret store using path (legacy method)")
+
+				// Migrate the key to the UUID-based method
+				if err = secretstore.Default.Put(secretName, mk); err != nil {
+					log.Warn().Err(err).Str("vault_id", vaultID).Msg("Failed to migrate key to UUID-based storage")
+				} else {
+					log.Info().Str("vault_id", vaultID).Msg("Key migrated to UUID-based storage")
+				}
+			}
+		} else {
+			// 3c. If vault ID doesn't exist, try to get the key using the path
+			log.Debug().Err(err).Msg("Failed to get vault ID, falling back to path-based method")
+
+			mk, err = secretstore.Default.Get(path)
+			if err != nil {
+				return fmt.Errorf("failed to get key from secret store (does it exist?): %w", err)
+			}
+			log.Info().Str("path", path).Msg("Key found in secret store using path (legacy method)")
+
+			// Generate a vault ID and store it in the metadata table
+			vaultID, err = vaultid.EnsureVaultID(db)
+			if err != nil {
+				log.Warn().Err(err).Msg("Failed to generate vault ID")
+			} else {
+				// Migrate the key to the UUID-based method
+				secretName := vaultid.FormatSecretName(vaultID)
+				if err = secretstore.Default.Put(secretName, mk); err != nil {
+					log.Warn().Err(err).Str("vault_id", vaultID).Msg("Failed to migrate key to UUID-based storage")
+				} else {
+					log.Info().Str("vault_id", vaultID).Msg("Key migrated to UUID-based storage")
+				}
+			}
+		}
+
+		// 4. Verify the key can decrypt data in the vault
 		secureDAO := dao.NewSecureVaultDAO(db, mk)
 		canaryKey := "__n1_canary__"
 		plaintext, err := secureDAO.Get(canaryKey)
 
 		if err == nil && string(plaintext) == "ok" {
-			log.Info().Str("path", path).Msg("✓ Vault check complete: Key verified and database accessible.")
+			if vaultID != "" {
+				log.Info().Str("path", path).Str("vault_id", vaultID).Msg("✓ Vault check complete: Key verified and database accessible.")
+			} else {
+				log.Info().Str("path", path).Msg("✓ Vault check complete: Key verified and database accessible.")
+			}
 			return nil
 		} else if errors.Is(err, dao.ErrNotFound) {
 			return fmt.Errorf("vault key found, but integrity check failed (canary missing). Vault may be incomplete or corrupt")
@@ -259,25 +318,63 @@ var keyRotateCmd = &cli.Command{
 			}
 		}
 
-		// 2. Get old key from store
-		oldMK, err := secretstore.Default.Get(originalPath)
-		if err != nil {
-			return fmt.Errorf("failed to get current key from secret store: %w", err)
-		}
-		log.Info().Msg("Retrieved current master key")
-
-		// 3. Generate new key
-		newMK, err := crypto.Generate(32)
-		if err != nil {
-			return fmt.Errorf("failed to generate new master key: %w", err)
-		}
-		log.Info().Msg("Generated new master key")
-
-		// Open original DB to list keys
+		// 2. Open original DB to get vault ID
 		originalDB, err := sqlite.Open(originalPath)
 		if err != nil {
 			return fmt.Errorf("failed to open database file '%s': %w", originalPath, err)
 		}
+
+		// Try to get the vault ID from the metadata table
+		vaultID, err := vaultid.GetVaultID(originalDB)
+		var oldMK []byte
+		var secretName string
+
+		if err == nil {
+			// If vault ID exists, try to get the key using the vault ID
+			secretName = vaultid.FormatSecretName(vaultID)
+			oldMK, err = secretstore.Default.Get(secretName)
+			if err == nil {
+				log.Info().Str("vault_id", vaultID).Msg("Retrieved current master key using vault ID")
+			} else {
+				log.Debug().Err(err).Str("vault_id", vaultID).Msg("Failed to get key using vault ID")
+
+				// Fall back to path-based method
+				oldMK, err = secretstore.Default.Get(originalPath)
+				if err != nil {
+					originalDB.Close()
+					return fmt.Errorf("failed to get current key from secret store: %w", err)
+				}
+				log.Info().Str("path", originalPath).Msg("Retrieved current master key using path (legacy method)")
+			}
+		} else {
+			// If vault ID doesn't exist, try to get the key using the path
+			log.Debug().Err(err).Msg("Failed to get vault ID, falling back to path-based method")
+
+			oldMK, err = secretstore.Default.Get(originalPath)
+			if err != nil {
+				originalDB.Close()
+				return fmt.Errorf("failed to get current key from secret store: %w", err)
+			}
+			log.Info().Str("path", originalPath).Msg("Retrieved current master key using path (legacy method)")
+
+			// Generate a vault ID and store it in the metadata table
+			vaultID, err = vaultid.EnsureVaultID(originalDB)
+			if err != nil {
+				log.Warn().Err(err).Msg("Failed to generate vault ID")
+			} else {
+				log.Info().Str("vault_id", vaultID).Msg("Generated and stored vault ID")
+			}
+		}
+
+		// 3. Generate new key
+		newMK, err := crypto.Generate(32)
+		if err != nil {
+			originalDB.Close()
+			return fmt.Errorf("failed to generate new master key: %w", err)
+		}
+		log.Info().Msg("Generated new master key")
+
+		// We already opened the original DB above
 
 		// Create a secure vault DAO with the old key
 		oldSecureDAO := dao.NewSecureVaultDAO(originalDB, oldMK)
@@ -400,11 +497,27 @@ var keyRotateCmd = &cli.Command{
 
 		// 9. Update key store
 		log.Info().Msg("Updating key store with new master key...")
-		if err := secretstore.Default.Put(originalPath, newMK); err != nil {
-			cleanup(true) // Keep backup on failure
-			return fmt.Errorf("failed to update master key in secret store: %w", err)
+
+		// If we have a vault ID, store the key using the vault ID
+		if vaultID != "" {
+			secretName = vaultid.FormatSecretName(vaultID)
+			if err := secretstore.Default.Put(secretName, newMK); err != nil {
+				cleanup(true) // Keep backup on failure
+				return fmt.Errorf("failed to update master key in secret store using vault ID: %w", err)
+			}
+			log.Info().Str("vault_id", vaultID).Msg("Key store updated successfully using vault ID")
 		}
-		log.Info().Msg("Key store updated successfully")
+
+		// Also update using the path for backward compatibility
+		if err := secretstore.Default.Put(originalPath, newMK); err != nil {
+			if vaultID == "" {
+				cleanup(true) // Keep backup on failure if we don't have a vault ID
+				return fmt.Errorf("failed to update master key in secret store: %w", err)
+			}
+			log.Warn().Err(err).Msg("Failed to update master key using path (backward compatibility)")
+		} else {
+			log.Info().Str("path", originalPath).Msg("Key store also updated using path (backward compatibility)")
+		}
 
 		// 10. Atomic replace
 		log.Info().Msg("Replacing original vault with new vault...")
@@ -424,7 +537,11 @@ var keyRotateCmd = &cli.Command{
 		}
 
 		// 12. Report success
-		log.Info().Msg("Key rotation completed successfully")
+		if vaultID != "" {
+			log.Info().Str("vault_id", vaultID).Msg("Key rotation completed successfully")
+		} else {
+			log.Info().Msg("Key rotation completed successfully")
+		}
 		return nil
 	},
 }
@@ -481,20 +598,66 @@ var putCmd = &cli.Command{
 		key := c.Args().Get(1)
 		value := c.Args().Get(2)
 
-		// 1. Get the master key from the secret store
-		mk, err := secretstore.Default.Get(path)
-		if err != nil {
-			return fmt.Errorf("failed to get key from secret store: %w", err)
-		}
-
-		// 2. Open the database
+		// 1. Open the database
 		db, err := sqlite.Open(path)
 		if err != nil {
 			return fmt.Errorf("failed to open database file '%s': %w", path, err)
 		}
 		defer db.Close()
 
-		// 3. Create a secure vault DAO
+		// 2. Try to get the vault ID from the metadata table
+		vaultID, err := vaultid.GetVaultID(db)
+		var mk []byte
+
+		if err == nil {
+			// 3a. If vault ID exists, try to get the key using the vault ID
+			secretName := vaultid.FormatSecretName(vaultID)
+			mk, err = secretstore.Default.Get(secretName)
+			if err == nil {
+				log.Debug().Str("vault_id", vaultID).Msg("Key found in secret store using vault ID")
+			} else {
+				log.Debug().Err(err).Str("vault_id", vaultID).Msg("Failed to get key using vault ID")
+
+				// 3b. Fall back to path-based method
+				mk, err = secretstore.Default.Get(path)
+				if err != nil {
+					return fmt.Errorf("failed to get key from secret store: %w", err)
+				}
+				log.Debug().Str("path", path).Msg("Key found in secret store using path (legacy method)")
+
+				// Migrate the key to the UUID-based method
+				if err = secretstore.Default.Put(secretName, mk); err != nil {
+					log.Warn().Err(err).Str("vault_id", vaultID).Msg("Failed to migrate key to UUID-based storage")
+				} else {
+					log.Debug().Str("vault_id", vaultID).Msg("Key migrated to UUID-based storage")
+				}
+			}
+		} else {
+			// 3c. If vault ID doesn't exist, try to get the key using the path
+			log.Debug().Err(err).Msg("Failed to get vault ID, falling back to path-based method")
+
+			mk, err = secretstore.Default.Get(path)
+			if err != nil {
+				return fmt.Errorf("failed to get key from secret store: %w", err)
+			}
+			log.Debug().Str("path", path).Msg("Key found in secret store using path (legacy method)")
+
+			// Generate a vault ID and store it in the metadata table
+			vaultID, err = vaultid.EnsureVaultID(db)
+			if err != nil {
+				log.Warn().Err(err).Msg("Failed to generate vault ID")
+			} else {
+				// Migrate the key to the UUID-based method
+				secretName := vaultid.FormatSecretName(vaultID)
+				if err = secretstore.Default.Put(secretName, mk); err != nil {
+					log.Warn().Err(err).Str("vault_id", vaultID).Msg("Failed to migrate key to UUID-based storage")
+				} else {
+					log.Debug().Str("vault_id", vaultID).Msg("Key migrated to UUID-based storage")
+				}
+			}
+		}
+
+		// 4. Create a secure vault DAO
 		vault := dao.NewSecureVaultDAO(db, mk)
 
 		// 4. Store the value
@@ -503,6 +666,73 @@ var putCmd = &cli.Command{
 		}
 
 		log.Info().Str("key", key).Msg("Value stored successfully")
+		return nil
+	},
+}
+
+// migrateCmd is the command for migrating from path-based to UUID-based key storage
+var migrateCmd = &cli.Command{
+	Name:      "migrate",
+	Usage:     "migrate <vault.db> – migrate from path-based to UUID-based key storage",
+	ArgsUsage: "<path>",
+	Flags: []cli.Flag{
+		&cli.BoolFlag{
+			Name:  "keep-old",
+			Usage: "Keep the old path-based key after migration",
+			Value: false,
+		},
+	},
+	Action: func(c *cli.Context) error {
+		if c.NArg() != 1 {
+			return cli.Exit("Usage: migrate [--keep-old] <vault.db>", 1)
+		}
+		path, err := filepath.Abs(c.Args().First())
+		if err != nil {
+			return fmt.Errorf("failed to get absolute path: %w", err)
+		}
+
+		keepOld := c.Bool("keep-old")
+
+		// 1. Open the database
+		db, err := sqlite.Open(path)
+		if err != nil {
+			return fmt.Errorf("failed to open database file '%s': %w", path, err)
+		}
+		defer db.Close()
+
+		// 2. Get the vault ID or generate one if it doesn't exist
+		vaultID, err := vaultid.EnsureVaultID(db)
+		if err != nil {
+			return fmt.Errorf("failed to ensure vault ID: %w", err)
+		}
+		log.Info().Str("vault_id", vaultID).Msg("Vault ID found or generated")
+
+		// 3. Get the master key using the path-based method
+		mk, err := secretstore.Default.Get(path)
+		if err != nil {
+			return fmt.Errorf("failed to get key from secret store using path: %w", err)
+		}
+		log.Info().Str("path", path).Msg("Retrieved master key using path")
+
+		// 4. Store the master key using the UUID-based method
+		secretName := vaultid.FormatSecretName(vaultID)
+		if err = secretstore.Default.Put(secretName, mk); err != nil {
+			return fmt.Errorf("failed to store master key using vault ID: %w", err)
+		}
+		log.Info().Str("vault_id", vaultID).Msg("Master key stored using vault ID")
+
+		// 5. Delete the old key if requested
+		if !keepOld {
+			if err = secretstore.Default.Delete(path); err != nil {
+				log.Warn().Err(err).Str("path", path).Msg("Failed to delete old key")
+			} else {
+				log.Info().Str("path", path).Msg("Old key deleted")
+			}
+		} else {
+			log.Info().Str("path", path).Msg("Old key kept for backward compatibility")
+		}
+
+		log.Info().Str("vault_id", vaultID).Msg("Migration completed successfully")
 		return nil
 	},
 }
@@ -521,20 +751,66 @@ var getCmd = &cli.Command{
 		}
 		key := c.Args().Get(1)
 
-		// 1. Get the master key from the secret store
-		mk, err := secretstore.Default.Get(path)
-		if err != nil {
-			return fmt.Errorf("failed to get key from secret store: %w", err)
-		}
-
-		// 2. Open the database
+		// 1. Open the database
 		db, err := sqlite.Open(path)
 		if err != nil {
 			return fmt.Errorf("failed to open database file '%s': %w", path, err)
 		}
 		defer db.Close()
 
-		// 3. Create a secure vault DAO
+		// 2. Try to get the vault ID from the metadata table
+		vaultID, err := vaultid.GetVaultID(db)
+		var mk []byte
+
+		if err == nil {
+			// 3a. If vault ID exists, try to get the key using the vault ID
+			secretName := vaultid.FormatSecretName(vaultID)
+			mk, err = secretstore.Default.Get(secretName)
+			if err == nil {
+				log.Debug().Str("vault_id", vaultID).Msg("Key found in secret store using vault ID")
+			} else {
+				log.Debug().Err(err).Str("vault_id", vaultID).Msg("Failed to get key using vault ID")
+
+				// 3b. Fall back to path-based method
+				mk, err = secretstore.Default.Get(path)
+				if err != nil {
+					return fmt.Errorf("failed to get key from secret store: %w", err)
+				}
+				log.Debug().Str("path", path).Msg("Key found in secret store using path (legacy method)")
+
+				// Migrate the key to the UUID-based method
+				if err = secretstore.Default.Put(secretName, mk); err != nil {
+					log.Warn().Err(err).Str("vault_id", vaultID).Msg("Failed to migrate key to UUID-based storage")
+				} else {
+					log.Debug().Str("vault_id", vaultID).Msg("Key migrated to UUID-based storage")
+				}
+			}
+		} else {
+			// 3c. If vault ID doesn't exist, try to get the key using the path
+			log.Debug().Err(err).Msg("Failed to get vault ID, falling back to path-based method")
+
+			mk, err = secretstore.Default.Get(path)
+			if err != nil {
+				return fmt.Errorf("failed to get key from secret store: %w", err)
+			}
+			log.Debug().Str("path", path).Msg("Key found in secret store using path (legacy method)")
+
+			// Generate a vault ID and store it in the metadata table
+			vaultID, err = vaultid.EnsureVaultID(db)
+			if err != nil {
+				log.Warn().Err(err).Msg("Failed to generate vault ID")
+			} else {
+				// Migrate the key to the UUID-based method
+				secretName := vaultid.FormatSecretName(vaultID)
+				if err = secretstore.Default.Put(secretName, mk); err != nil {
+					log.Warn().Err(err).Str("vault_id", vaultID).Msg("Failed to migrate key to UUID-based storage")
+				} else {
+					log.Debug().Str("vault_id", vaultID).Msg("Key migrated to UUID-based storage")
+				}
+			}
+		}
+
+		// 4. Create a secure vault DAO
 		vault := dao.NewSecureVaultDAO(db, mk)
 
 		// 4. Retrieve the value

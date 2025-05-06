@@ -28,11 +28,22 @@ func InitVaultMigrations(runner *Runner) {
 	runner.AddMigration(
 		3,
 		"Create trigger for updated_at",
-		`CREATE TRIGGER trig_vault_updated_at 
+		`CREATE TRIGGER trig_vault_updated_at
 		AFTER UPDATE ON vault
 		BEGIN
 			UPDATE vault SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
 		END`,
+	)
+
+	// Migration 4: Create metadata table for vault information
+	runner.AddMigration(
+		4,
+		"Create metadata table",
+		`CREATE TABLE IF NOT EXISTS metadata (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL,
+			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)`,
 	)
 }
 

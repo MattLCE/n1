@@ -18,6 +18,7 @@ import (
 	"github.com/n1/n1/internal/dao"
 	"github.com/n1/n1/internal/secretstore"
 	"github.com/n1/n1/internal/sqlite"
+	"github.com/n1/n1/internal/vaultid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -379,24 +380,33 @@ func TestSyncBasicNetwork(t *testing.T) {
 	_, statErr = os.Stat(vault2Path)
 	require.NoError(t, statErr, "Vault file %s should exist after init", vault2Path)
 
-	// --- Manually store keys with CONSISTENT names ---
-	// This bypasses bosr init's key storage mechanism for the test
-	key1Name := "vault_vault1"
-	key2Name := "vault_vault2"
+	// --- Store keys using vault ID mechanism ---
 	secretStorePath := os.Getenv("N1_SECRET_STORE_PATH") // Get base path
 	require.NotEmpty(t, secretStorePath, "N1_SECRET_STORE_PATH must be set")
+
+	// Get or create vault ID for vault 1
+	vaultID1, err := vaultid.EnsureVaultIDFromPath(vault1Path)
+	require.NoError(t, err, "Failed to ensure vault ID for vault1")
+	key1Name := vaultid.FormatSecretName(vaultID1)
+	t.Logf("Using vault ID %s for vault1", vaultID1)
+
+	// Get or create vault ID for vault 2
+	vaultID2, err := vaultid.EnsureVaultIDFromPath(vault2Path)
+	require.NoError(t, err, "Failed to ensure vault ID for vault2")
+	key2Name := vaultid.FormatSecretName(vaultID2)
+	t.Logf("Using vault ID %s for vault2", vaultID2)
 
 	// Create key for vault 1
 	mk1, err := crypto.Generate(32)
 	require.NoError(t, err)
-	err = secretstore.Default.Put(key1Name, mk1) // Use consistent name
+	err = secretstore.Default.Put(key1Name, mk1) // Use vault ID-based name
 	require.NoError(t, err, "Failed to manually store key for %s", key1Name)
 	t.Logf("Manually stored key for %s in %s", key1Name, secretStorePath)
 
 	// Create key for vault 2
 	mk2, err := crypto.Generate(32)
 	require.NoError(t, err)
-	err = secretstore.Default.Put(key2Name, mk2) // Use consistent name
+	err = secretstore.Default.Put(key2Name, mk2) // Use vault ID-based name
 	require.NoError(t, err, "Failed to manually store key for %s", key2Name)
 	t.Logf("Manually stored key for %s in %s", key2Name, secretStorePath)
 
@@ -537,6 +547,11 @@ func TestSyncResumableWithNetworkInterruption(t *testing.T) {
 	output, err := cmd.CombinedOutput()
 	require.NoError(t, err, "Failed to initialize vault1: %s", output)
 
+	// Ensure vault1 has a vault ID
+	vaultID1, err := vaultid.EnsureVaultIDFromPath(vault1Path)
+	require.NoError(t, err, "Failed to ensure vault ID for vault1")
+	t.Logf("Using vault ID %s for vault1", vaultID1)
+
 	// Create a large file (5MB) to add to vault1
 	largeFile, err := os.Create(largeFilePath)
 	require.NoError(t, err, "Failed to create large file")
@@ -559,6 +574,11 @@ func TestSyncResumableWithNetworkInterruption(t *testing.T) {
 	cmd = exec.Command("bosr", "init", vault2Path)
 	output, err = cmd.CombinedOutput()
 	require.NoError(t, err, "Failed to initialize vault2: %s", output)
+
+	// Ensure vault2 has a vault ID
+	vaultID2, err := vaultid.EnsureVaultIDFromPath(vault2Path)
+	require.NoError(t, err, "Failed to ensure vault ID for vault2")
+	t.Logf("Using vault ID %s for vault2", vaultID2)
 
 	// Apply a slow network profile to the proxy
 	slowProfile := NetworkProfile{
@@ -673,11 +693,21 @@ func TestSyncContinuousWithNetworkChanges(t *testing.T) {
 	output, err := cmd.CombinedOutput()
 	require.NoError(t, err, "Failed to initialize vault1: %s", output)
 
+	// Ensure vault1 has a vault ID
+	vaultID1, err := vaultid.EnsureVaultIDFromPath(vault1Path)
+	require.NoError(t, err, "Failed to ensure vault ID for vault1")
+	t.Logf("Using vault ID %s for vault1", vaultID1)
+
 	// Initialize vault2
 	vault2Path := filepath.Join(testDir, "vault2.db")
 	cmd = exec.Command("bosr", "init", vault2Path)
 	output, err = cmd.CombinedOutput()
 	require.NoError(t, err, "Failed to initialize vault2: %s", output)
+
+	// Ensure vault2 has a vault ID
+	vaultID2, err := vaultid.EnsureVaultIDFromPath(vault2Path)
+	require.NoError(t, err, "Failed to ensure vault ID for vault2")
+	t.Logf("Using vault ID %s for vault2", vaultID2)
 
 	// Apply normal network profile
 	err = toxiClient.ApplyNetworkProfile(proxyName, NormalLAN)

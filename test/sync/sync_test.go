@@ -17,6 +17,7 @@ import (
 	"github.com/n1/n1/internal/miror"
 	"github.com/n1/n1/internal/secretstore"
 	"github.com/n1/n1/internal/sqlite"
+	"github.com/n1/n1/internal/vaultid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -352,22 +353,31 @@ func createTestVault(path string) (*sql.DB, []byte, error) {
 		return nil, nil, err
 	}
 
-	// Store the master key
-	if err := secretstore.Default.Put(path, mk); err != nil {
-		return nil, nil, err
-	}
-
 	// Create the database
 	db, err := sqlite.Open(path)
 	if err != nil {
-		_ = secretstore.Default.Delete(path)
 		return nil, nil, err
 	}
 
 	// Initialize the schema
 	if err := migrations.BootstrapVault(db); err != nil {
 		db.Close()
-		_ = secretstore.Default.Delete(path)
+		return nil, nil, err
+	}
+
+	// Get or create a vault ID
+	vaultID, err := vaultid.EnsureVaultID(db)
+	if err != nil {
+		db.Close()
+		return nil, nil, err
+	}
+
+	// Format the secret name using the vault ID
+	secretName := vaultid.FormatSecretName(vaultID)
+
+	// Store the master key using the vault ID-based secret name
+	if err := secretstore.Default.Put(secretName, mk); err != nil {
+		db.Close()
 		return nil, nil, err
 	}
 
@@ -375,7 +385,7 @@ func createTestVault(path string) (*sql.DB, []byte, error) {
 	secureDAO := dao.NewSecureVaultDAO(db, mk)
 	if err := secureDAO.Put("__n1_canary__", []byte("ok")); err != nil {
 		db.Close()
-		_ = secretstore.Default.Delete(path)
+		_ = secretstore.Default.Delete(secretName)
 		return nil, nil, err
 	}
 
