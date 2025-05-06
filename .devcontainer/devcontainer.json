@@ -1,15 +1,29 @@
 // .devcontainer/devcontainer.json
 {
   "name": "n1-dev",
-  "image": "mcr.microsoft.com/devcontainers/go:1.23", // Sticking with Bookworm base for now
+  "image": "mcr.microsoft.com/devcontainers/go:1.23",
 
-  // Define environment variables for the container - REMOVED LD_LIBRARY_PATH
-  // "containerEnv": {}, // Can remove if empty
+  // Use the official feature to handle Docker access
+  "features": {
+    "ghcr.io/devcontainers/features/docker-from-docker:1": {}
+  },
 
-  // Simplified postCreateCommand - removed SQLCipher build
-  "postCreateCommand": "bash -xc 'export DEBIAN_FRONTEND=noninteractive && sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential libssl-dev git sqlite3 && sudo apt-get clean && sudo rm -rf /var/lib/apt/lists/* && go env -w GOPRIVATE=github.com/n1/* && go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest'",
-// ^^ Kept build-essential, libssl-dev (for keyring/crypto), git, sqlite3 (CLI tool)
-// ^^ Removed tcl, clone, configure, make, make install, ldconfig, rm -rf /tmp/sqlcipher
+  // REMOVED the mounts section
 
-  "postAttachCommand": "echo \"🎉  dev-container ready (standard SQLite)\"" // Updated message
+  // CORRECTED postCreateCommand - removed internal comments
+  "postCreateCommand": "bash -xc 'export DEBIAN_FRONTEND=noninteractive \\\n && sudo apt-get update \\\n && sudo apt-get install -y --no-install-recommends build-essential libssl-dev git sqlite3 \\\n && sudo apt-get clean \\\n && sudo rm -rf /var/lib/apt/lists/* \\\n && go env -w GOPRIVATE=github.com/n1/* \\\n && go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest'",
+
+  // Keep customizations
+  "customizations": {
+    "vscode": {
+      "settings": {},
+      "extensions": [
+        "golang.go",
+        "pavelkucera.vscode-roocode",
+        "ms-azuretools.vscode-docker",
+        "github.copilot"
+      ]
+    }
+  },
+  "postAttachCommand": "echo \"🎉  dev-container ready (standard SQLite + Docker CLI via Feature)\""
 }

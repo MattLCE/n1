@@ -1,0 +1,82 @@
+name: Sync Tests
+
+on:
+  push:
+    branches: [ main, milestones/* ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.23'
+        
+    - name: Build
+      run: make build
+      
+    - name: Run unit tests
+      run: make test
+      
+  network-tests:
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    - name: Run network tests
+      run: make test-net
+      
+    - name: Archive test logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-logs
+        path: test/sync/data/**/logs/*.log
+        
+  cross-platform-build:
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    strategy:
+      matrix:
+        include:
+          - os: windows
+            arch: amd64
+            output: bosr.exe
+          - os: linux
+            arch: amd64
+            output: bosr-linux-amd64
+          - os: linux
+            arch: arm64
+            output: bosr-linux-arm64
+          - os: darwin
+            arch: amd64
+            output: bosr-darwin-amd64
+          - os: darwin
+            arch: arm64
+            output: bosr-darwin-arm64
+            
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.23'
+        
+    - name: Build for ${{ matrix.os }}-${{ matrix.arch }}
+      run: GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch }} go build -o bin/${{ matrix.output }} ./cmd/bosr
+      
+    - name: Upload binary
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.output }}
+        path: bin/${{ matrix.output }}

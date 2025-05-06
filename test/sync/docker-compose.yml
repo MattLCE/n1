@@ -1,0 +1,70 @@
+# REMOVED obsolete version: '3' line
+
+services:
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.5.0
+    ports:
+      - "8474:8474"  # Control API
+      - "7000-7010:7000-7010"  # Range for proxied ports
+    networks:
+      - test-net
+
+  vault1:
+    build:
+      context: ../..
+      dockerfile: test/sync/Dockerfile
+    volumes:
+      - ./data/vault1:/data  # Mount specific vault data
+      - secrets:/secrets     # Mount shared secrets volume
+    environment:
+      - N1_NODE_ID=vault1
+      - N1_LISTEN_ADDR=0.0.0.0:7001
+      - N1_TOXIPROXY_ADDR=toxiproxy:8474
+      - N1_SECRET_STORE_PATH=/secrets # ADDED: Use the shared secrets volume
+    depends_on:
+      - toxiproxy
+    networks:
+      - test-net
+
+  vault2:
+    build:
+      context: ../..
+      dockerfile: test/sync/Dockerfile
+    volumes:
+      - ./data/vault2:/data  # Mount specific vault data
+      - secrets:/secrets     # Mount shared secrets volume
+    environment:
+      - N1_NODE_ID=vault2
+      - N1_LISTEN_ADDR=0.0.0.0:7002
+      - N1_TOXIPROXY_ADDR=toxiproxy:8474
+      - N1_SECRET_STORE_PATH=/secrets # ADDED: Use the shared secrets volume
+    depends_on:
+      - toxiproxy
+    networks:
+      - test-net
+
+  test-runner:
+    build:
+      context: ../..
+      dockerfile: test/sync/Dockerfile.test
+    volumes:
+      - ./:/test           # Mount the test sync dir
+      - secrets:/secrets     # Mount shared secrets volume
+    environment:
+      - N1_TOXIPROXY_ADDR=toxiproxy:8474
+      - N1_VAULT1_ADDR=vault1:7001
+      - N1_VAULT2_ADDR=vault2:7002
+      - N1_SECRET_STORE_PATH=/secrets # ADDED: Use the shared secrets volume
+    depends_on:
+      - vault1
+      - vault2
+    networks:
+      - test-net
+
+networks:
+  test-net:
+    driver: bridge
+
+# ADDED: Define the named volume for shared secrets
+volumes:
+  secrets:

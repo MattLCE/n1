@@ -3,6 +3,10 @@
 # This script dumps the content of all files TRACKED by Git (respecting .gitignore)
 # into workspace_dump.txt in the current directory, prefixed with a timestamp.
 # run with bash dump_workspace.sh -> see results in workspace_dump.txt
+# remove from git tracking with:
+# 1) git rm --cached workspace_dump.txt to remove from staging area without deleting local file
+# 2) git commit -m "chore: Untrack workspace_dump.txt" to make git no longer track this file
+
 
 OUTPUT_FILE="workspace_dump.txt"
 
